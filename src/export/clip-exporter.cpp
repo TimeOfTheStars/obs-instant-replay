@@ -19,6 +19,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "clip-exporter.hpp"
 
 #include "core/angle-manager.hpp"
+
+#include <media-io/video-io.h>
 #include "export-path.hpp"
 
 #include <obs-frontend-api.h>
@@ -231,6 +233,7 @@ int ClipExporter::enqueue(int angle, const Clip &clip, const std::string &path, 
 	job.path = path;
 	job.encoder = resolve_encoder(options.encoder);
 	job.crf = std::clamp(options.crf, 10, 30);
+	job.thread_budget = options.thread_budget;
 
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -242,7 +245,7 @@ int ClipExporter::enqueue(int angle, const Clip &clip, const std::string &path, 
 		queue_.push_back(job);
 	}
 
-	ensure_worker();
+	ensure_workers();
 	wake_.notify_one();
 	return job.id;
 }
@@ -254,14 +257,20 @@ ExportStatus ClipExporter::status(int job_id) const
 	return found == statuses_.end() ? ExportStatus{} : found->second;
 }
 
-void ClipExporter::ensure_worker()
+void ClipExporter::ensure_workers()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
-	if (worker_.joinable())
+	if (stop_.load(std::memory_order_acquire))
 		return;
 
-	stop_.store(false, std::memory_order_release);
-	worker_ = std::thread([this] { worker_loop(); });
+	/*
+	 * One worker per angle: a single queue would encode the angles one after another, and on a
+	 * short ring every angle but the first would find its head already overwritten. Workers read
+	 * different rings, so they do not race each other.
+	 */
+	const size_t wanted = safe_mode() ? 1u : static_cast<size_t>(kAngleCount);
+	while (workers_.size() < wanted && workers_.size() < queue_.size() + workers_.size())
+		workers_.emplace_back([this] { worker_loop(); });
 }
 
 void ClipExporter::shutdown()
@@ -272,8 +281,67 @@ void ClipExporter::shutdown()
 		queue_.clear();
 	}
 	wake_.notify_all();
-	if (worker_.joinable())
-		worker_.join();
+	for (std::thread &worker : workers_) {
+		if (worker.joinable())
+			worker.join();
+	}
+	workers_.clear();
+}
+
+bool ClipExporter::take_job(Job &job)
+{
+	std::unique_lock<std::mutex> lock(mutex_);
+	wake_.wait(lock, [this] { return stop_.load(std::memory_order_acquire) || !queue_.empty(); });
+	if (stop_.load(std::memory_order_acquire))
+		return false;
+
+	/* The programme is what goes on air first, so it never waits behind a camera. */
+	auto chosen = queue_.begin();
+	for (auto candidate = queue_.begin(); candidate != queue_.end(); ++candidate) {
+		if (candidate->angle == kProgramAngle) {
+			chosen = candidate;
+			break;
+		}
+	}
+
+	job = *chosen;
+	queue_.erase(chosen);
+	return true;
+}
+
+void ClipExporter::note_job_started()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (running_jobs_++ == 0) {
+		/* Snapshot once per burst of exports, so the cost is attributed to the MARK as a whole. */
+		skipped_at_start_ = video_output_get_skipped_frames(obs_get_video());
+		lagged_at_start_ = obs_get_lagged_frames();
+	}
+}
+
+void ClipExporter::note_job_finished()
+{
+	uint32_t skipped = 0;
+	uint32_t lagged = 0;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (--running_jobs_ > 0)
+			return;
+
+		const uint32_t skipped_now = video_output_get_skipped_frames(obs_get_video());
+		const uint32_t lagged_now = obs_get_lagged_frames();
+		skipped = skipped_now > skipped_at_start_ ? skipped_now - skipped_at_start_ : 0;
+		lagged = lagged_now > lagged_at_start_ ? lagged_now - lagged_at_start_ : 0;
+	}
+
+	if (skipped == 0 && lagged == 0)
+		return;
+
+	obs_log(LOG_WARNING, "export cost the broadcast %u encoded and %u rendered frames", skipped, lagged);
+
+	/* Losing frames on air is not worth a faster export: stay conservative for the rest of the session. */
+	if (skipped + lagged > 2 && !safe_mode_.exchange(true, std::memory_order_acq_rel))
+		obs_log(LOG_WARNING, "export switched to safe mode: one angle at a time, faster preset");
 }
 
 void ClipExporter::update(int job_id, ExportState state, uint64_t done, uint64_t total, const std::string &path,
@@ -303,15 +371,12 @@ void ClipExporter::worker_loop()
 
 	while (true) {
 		Job job;
-		{
-			std::unique_lock<std::mutex> lock(mutex_);
-			wake_.wait(lock, [this] { return stop_.load(std::memory_order_acquire) || !queue_.empty(); });
-			if (stop_.load(std::memory_order_acquire))
-				return;
-			job = queue_.front();
-			queue_.pop_front();
-		}
+		if (!take_job(job))
+			return;
+
+		note_job_started();
 		run(job);
+		note_job_finished();
 	}
 }
 
@@ -366,6 +431,7 @@ void ClipExporter::run(const Job &job)
 				    "h264_amf",          "h264_qsv", "libopenh264"};
 	std::string open_errors;
 	const AVCodec *codec = nullptr;
+	bool holds_hardware_slot = false;
 
 	for (const char *name : candidates) {
 		const AVCodec *candidate = avcodec_find_encoder_by_name(name);
@@ -373,6 +439,20 @@ void ClipExporter::run(const Job &job)
 			continue;
 		if (!hardware_encoder_available(name))
 			continue; /* no point probing a vendor's encoder on a machine without that GPU */
+
+		const bool hardware = strcmp(candidate->name, "libx264") != 0 &&
+				      strcmp(candidate->name, "libopenh264") != 0;
+		if (hardware && !holds_hardware_slot) {
+			/*
+			 * Consumer GPUs cap concurrent encoder sessions and the broadcast already holds one,
+			 * so only one export at a time may use the hardware; the rest fall back to x264.
+			 */
+			if (hardware_jobs_.fetch_add(1, std::memory_order_acq_rel) != 0) {
+				hardware_jobs_.fetch_sub(1, std::memory_order_acq_rel);
+				continue;
+			}
+			holds_hardware_slot = true;
+		}
 
 		bool already_tried = false;
 		for (const char *earlier : candidates) {
@@ -400,8 +480,10 @@ void ClipExporter::run(const Job &job)
 
 		if (strcmp(candidate->name, "libx264") == 0) {
 			/* Leave most cores to the stream encoder; veryfast still beats 50 fps on a modest CPU. */
-			session.codec->thread_count = std::clamp(os_get_logical_cores() / 2, 2, 6);
-			av_opt_set(session.codec->priv_data, "preset", "veryfast", 0);
+			session.codec->thread_count = job.thread_budget > 0
+							      ? job.thread_budget
+							      : std::clamp(os_get_logical_cores() / 2, 2, 6);
+			av_opt_set(session.codec->priv_data, "preset", safe_mode() ? "superfast" : "veryfast", 0);
 			av_opt_set_int(session.codec->priv_data, "crf", job.crf, 0);
 		} else if (strcmp(candidate->name, "h264_nvenc") == 0) {
 			av_opt_set(session.codec->priv_data, "preset", "p5", 0);
@@ -625,6 +707,9 @@ void ClipExporter::run(const Job &job)
 		avcodec_send_frame(session.codec, nullptr);
 		drain(true);
 	}
+
+	if (holds_hardware_slot)
+		hardware_jobs_.fetch_sub(1, std::memory_order_acq_rel);
 
 	const double seconds = static_cast<double>(os_gettime_ns() - started) / 1e9;
 	/* Encoding speed decides whether several angles can be exported at once; log it to tune that. */

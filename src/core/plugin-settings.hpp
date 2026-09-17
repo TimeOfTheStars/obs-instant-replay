@@ -48,6 +48,8 @@ struct PluginSettings {
 
 	/* Export: every MARK writes the programme clip to <export_dir>/<YYYY-MM-DD>/ */
 	bool export_enabled = true;
+	/* Which angles MARK writes to disk: index 0 is the programme, 1..3 the cameras. */
+	std::array<bool, kAngleCount> export_angles = {true, false, false, false};
 	std::string export_dir;              /* empty = OBS recording folder */
 	std::string export_encoder = "auto"; /* auto | x264 | nvenc | amf | qsv */
 	int export_crf = 18;

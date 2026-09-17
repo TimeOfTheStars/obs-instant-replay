@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #pragma once
 
 #include "core/angle-manager.hpp"
+#include "export/clip-exporter.hpp"
 #include "core/playback-engine.hpp"
 
 #include <obs.h>
@@ -73,6 +74,7 @@ private slots:
 	void onTimelineChanged(double in_sec, double out_sec);
 	void onEventsContextMenu(const QPoint &position);
 	void onSettingsChanged();
+	void onExportAnglesChanged();
 	void applyBufferSetting();
 	void onCameraSettingsChanged();
 	void onAngleClicked(int angle);
@@ -111,6 +113,7 @@ private:
 	QCheckBox *export_check = nullptr;
 	QLineEdit *export_dir_edit = nullptr;
 	QComboBox *export_encoder_combo = nullptr;
+	std::array<QCheckBox *, kAngleCount> export_angle_checks = {};
 	QListWidget *events_list = nullptr;
 	ReplayTimeline *timeline = nullptr;
 	QLabel *timeline_label = nullptr;
@@ -131,7 +134,9 @@ private:
 	struct Event {
 		Clip clip;
 		QString name;
-		int export_job = 0; /* 0 = not exported */
+		/* One entry per angle: 0 is the programme, 1..3 the cameras. */
+		std::array<EventAngle, kAngleCount> angles;
+		bool all_terminal = true; /* nothing left to poll */
 	};
 
 	/* Marked clips, in the order they were created; the list widget stores indices into this. */

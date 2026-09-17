@@ -55,6 +55,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QMenu>
 #include <QShortcut>
 #include <QTime>
+
+#include <util/platform.h>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -714,7 +716,22 @@ QWidget *ReplayDock::buildExportBox()
 	connect(export_encoder_combo, &QComboBox::currentIndexChanged, this, &ReplayDock::onSettingsChanged);
 	encoder_row->addWidget(export_encoder_combo, 1);
 
+	/* Which angles MARK writes: one narrow checkbox each, so the row fits a 320 px dock. */
+	auto *angles_row = new QHBoxLayout();
+	angles_row->addWidget(new QLabel(obs_module_text("Replay.Export.Angles"), box));
+	for (int angle = 0; angle < kAngleCount; ++angle) {
+		const QString label = angle == kProgramAngle ? QString(obs_module_text("Replay.Angle.Short.Program"))
+							     : QString::number(angle);
+		auto *check = new QCheckBox(label, box);
+		check->setChecked(settings.export_angles[static_cast<size_t>(angle)]);
+		connect(check, &QCheckBox::toggled, this, &ReplayDock::onExportAnglesChanged);
+		export_angle_checks[static_cast<size_t>(angle)] = check;
+		angles_row->addWidget(check);
+	}
+	angles_row->addStretch(1);
+
 	layout->addWidget(export_check);
+	layout->addLayout(angles_row);
 	layout->addLayout(folder_row);
 	layout->addLayout(encoder_row);
 	return box;
@@ -760,22 +777,55 @@ void ReplayDock::onMark()
 	Event event;
 	event.clip = clip;
 	event.name = QStringLiteral("%1 %2").arg(obs_module_text("Replay.Event")).arg(events.size() + 1);
-	if (PluginSettings::instance().export_enabled) {
-		const PluginSettings &settings = PluginSettings::instance();
-		const std::string base = export_base_directory(settings.export_dir);
+	const PluginSettings &settings = PluginSettings::instance();
+	if (settings.export_enabled) {
+		AngleManager &angles = AngleManager::instance();
+
+		/* Decide the whole set first: the thread budget depends on how many angles are queued. */
+		std::vector<int> queued;
+		for (int angle = 0; angle < kAngleCount; ++angle) {
+			if (!settings.export_angles[static_cast<size_t>(angle)])
+				continue;
+			if (!angles.angle(angle).running())
+				continue;
+			queued.push_back(angle);
+		}
 
 		std::string stem;
 		std::string path_error;
-		if (build_export_stem(base, event.name.toStdString(), ClipExporter::instance().reserve_sequence(), stem,
-				      path_error)) {
-			ExportOptions options;
-			options.encoder = settings.export_encoder;
-			options.crf = settings.export_crf;
-			event.export_job = ClipExporter::instance().enqueue(
-				kProgramAngle, clip, export_angle_file(stem, kProgramAngle), options);
-		} else {
+		if (queued.empty()) {
+			/* Nothing ticked, or the ticked cameras are not buffering — say so instead of staying mute. */
+			obs_log(LOG_WARNING, "export: no angle available to save");
+		} else if (!build_export_stem(export_base_directory(settings.export_dir), event.name.toStdString(),
+					      ClipExporter::instance().reserve_sequence(), stem, path_error)) {
 			obs_log(LOG_WARNING, "export: %s", path_error.c_str());
 			format_label->setText(QString::fromStdString(path_error));
+		} else {
+			/*
+			 * Split x264 threads across the jobs, otherwise three exports would each grab half the
+			 * machine and starve the encoder that is feeding the broadcast.
+			 */
+			const int budget = std::max(2, os_get_logical_cores() / 2);
+			const int program_threads = std::max(2, budget / 2);
+			const int camera_jobs =
+				static_cast<int>(queued.size()) -
+				(std::find(queued.begin(), queued.end(), kProgramAngle) != queued.end() ? 1 : 0);
+			const int camera_threads =
+				camera_jobs > 0 ? std::max(1, (budget - program_threads) / camera_jobs) : 0;
+
+			for (int angle : queued) {
+				ExportOptions options;
+				options.encoder = settings.export_encoder;
+				options.crf = settings.export_crf;
+				options.thread_budget = angle == kProgramAngle ? program_threads : camera_threads;
+
+				EventAngle &slot = event.angles[static_cast<size_t>(angle)];
+				slot.requested = true;
+				slot.path = export_angle_file(stem, angle);
+				slot.state = ExportState::Queued;
+				slot.job = ClipExporter::instance().enqueue(angle, clip, slot.path, options);
+			}
+			event.all_terminal = false;
 		}
 	}
 
@@ -804,34 +854,72 @@ void ReplayDock::updateEventItem(int event_index)
 
 		const Event &event = events[static_cast<size_t>(event_index)];
 		QString text = QStringLiteral("%1   %2 s").arg(event.name).arg(event.clip.duration_sec(), 0, 'f', 1);
-		if (event.export_job > 0) {
-			const ExportStatus status = ClipExporter::instance().status(event.export_job);
-			switch (status.state) {
+
+		/*
+		 * At 320 px the row fits roughly 42 characters, so the per-angle state is glyphs only and
+		 * the words live in the tooltip.
+		 */
+		QString strip;
+		QString tooltip;
+		int percent = -1;
+		for (int angle = 0; angle < kAngleCount; ++angle) {
+			const EventAngle &slot = event.angles[static_cast<size_t>(angle)];
+			if (!slot.requested)
+				continue;
+
+			const QString label = angle == kProgramAngle
+						      ? QString(obs_module_text("Replay.Angle.Short.Program"))
+						      : QString::number(angle);
+			QString glyph;
+			QString words;
+			switch (slot.state) {
 			case ExportState::Queued:
-				text += QStringLiteral("   ● %1").arg(obs_module_text("Replay.Export.Queued"));
+				glyph = QStringLiteral("·");
+				words = obs_module_text("Replay.Export.Queued");
 				break;
 			case ExportState::Encoding: {
-				const int percent =
-					status.frames_total
-						? static_cast<int>(status.frames_done * 100 / status.frames_total)
-						: 0;
-				text += QStringLiteral("   ● %1 %2%")
-						.arg(obs_module_text("Replay.Export.Saving"))
-						.arg(percent);
+				glyph = QStringLiteral("◐");
+				words = obs_module_text("Replay.Export.Saving");
+				const ExportStatus status = ClipExporter::instance().status(slot.job);
+				if (status.frames_total > 0) {
+					const int done =
+						static_cast<int>(status.frames_done * 100 / status.frames_total);
+					percent = percent < 0 ? done : std::min(percent, done);
+				}
 				break;
 			}
 			case ExportState::Done:
-				text += QStringLiteral("   ✓ %1").arg(obs_module_text("Replay.Export.Saved"));
+				glyph = QStringLiteral("✓");
+				words = obs_module_text("Replay.Export.Saved");
 				break;
 			case ExportState::DoneTruncated:
-				text += QStringLiteral("   ✓ %1").arg(obs_module_text("Replay.Export.SavedTruncated"));
+				glyph = QStringLiteral("≈");
+				words = obs_module_text("Replay.Export.SavedTruncated");
 				break;
 			case ExportState::Failed:
-				text += QStringLiteral("   ✗ %1").arg(QString::fromStdString(status.error));
+				glyph = QStringLiteral("✗");
+				words = QString::fromStdString(ClipExporter::instance().status(slot.job).error);
 				break;
 			}
-			item->setToolTip(QString::fromStdString(status.path));
+
+			strip += QStringLiteral(" %1%2").arg(label).arg(glyph);
+			tooltip += QStringLiteral("%1 %2 — %3\n")
+					   .arg(obs_module_text("Replay.Angle.Word"))
+					   .arg(angle == kProgramAngle
+							? QString(obs_module_text("Replay.Angle.Program"))
+							: QString::number(angle))
+					   .arg(words);
+			if (!slot.path.empty())
+				tooltip += QStringLiteral("    %1\n").arg(QString::fromStdString(slot.path));
 		}
+
+		if (!strip.isEmpty()) {
+			text += QStringLiteral("  ") + strip.trimmed();
+			if (percent >= 0)
+				text += QStringLiteral(" %1%").arg(percent);
+			item->setToolTip(tooltip.trimmed());
+		}
+
 		item->setText(text);
 		return;
 	}
@@ -1019,6 +1107,16 @@ void ReplayDock::clampClipLength()
 		QStringLiteral("%1 %2 s").arg(obs_module_text("Replay.Length.Limit")).arg(limit, 0, 'f', 1));
 }
 
+void ReplayDock::onExportAnglesChanged()
+{
+	PluginSettings &settings = PluginSettings::instance();
+	for (int angle = 0; angle < kAngleCount; ++angle)
+		settings.export_angles[static_cast<size_t>(angle)] =
+			export_angle_checks[static_cast<size_t>(angle)]->isChecked();
+	save_timer->start();
+	updateMemoryLabel();
+}
+
 void ReplayDock::onSettingsChanged()
 {
 	clampClipLength();
@@ -1069,10 +1167,27 @@ void ReplayDock::onSpeedChanged(int percent)
 
 void ReplayDock::refreshStatus()
 {
-	/* Export progress lives in the list items; a handful of rows at 10 Hz is cheap to repaint. */
+	/* Only rows with a job still running need repainting; finished ones are left alone. */
 	for (size_t index = 0; index < events.size(); ++index) {
-		if (events[index].export_job > 0)
-			updateEventItem(static_cast<int>(index));
+		Event &event = events[index];
+		if (event.all_terminal)
+			continue;
+
+		bool all_terminal = true;
+		for (EventAngle &slot : event.angles) {
+			if (!slot.requested || slot.terminal())
+				continue;
+
+			const ExportStatus status = ClipExporter::instance().status(slot.job);
+			slot.state = status.state;
+			slot.media = status.media;
+			if (!status.path.empty())
+				slot.path = status.path;
+			all_terminal = all_terminal && slot.terminal();
+		}
+
+		event.all_terminal = all_terminal;
+		updateEventItem(static_cast<int>(index));
 	}
 
 	AngleManager &angles = AngleManager::instance();
@@ -1106,6 +1221,16 @@ void ReplayDock::refreshStatus()
 	if (cameras.isEmpty())
 		cameras = obs_module_text("Replay.Angles.NoneHint");
 	cameras_label->setText(cameras);
+
+	/* A camera that is not buffering has nothing to export; do not let the operator tick it. */
+	for (int angle = 1; angle < kAngleCount; ++angle) {
+		QCheckBox *check = export_angle_checks[static_cast<size_t>(angle)];
+		if (!check)
+			continue;
+		const bool usable = angles.camera_state(angle - 1).enabled;
+		check->setEnabled(usable);
+		check->setToolTip(usable ? QString() : QString(obs_module_text("Replay.Angle.Tip.NotConfigured")));
+	}
 
 	const CaptureStatus status = angles.program().status();
 

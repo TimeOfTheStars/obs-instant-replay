@@ -28,6 +28,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 enum class ExportState { Queued, Encoding, Done, DoneTruncated, Failed };
 
@@ -55,10 +56,30 @@ struct ExportStatus {
 	ExportMedia media;
 };
 
+/* One angle of one event, as the panel tracks it. */
+struct EventAngle {
+	bool requested = false; /* was ticked for saving when MARK was pressed */
+	int job = 0;
+	ExportState state = ExportState::Queued;
+	std::string path;
+	ExportMedia media;
+
+	bool playable() const
+	{
+		return (state == ExportState::Done || state == ExportState::DoneTruncated) && !path.empty();
+	}
+	bool terminal() const
+	{
+		return state == ExportState::Done || state == ExportState::DoneTruncated ||
+		       state == ExportState::Failed;
+	}
+};
+
 struct ExportOptions {
-	std::string encoder = "auto"; /* auto | x264 | nvenc */
+	std::string encoder = "auto"; /* auto | x264 | nvenc | amf | qsv */
 	int crf = 18;
-	std::string base_dir; /* empty = OBS recording folder */
+	/* x264 threads this job may take; 0 = decide alone. Split across angles so the stream keeps cores. */
+	int thread_budget = 0;
 };
 
 /*
@@ -83,8 +104,11 @@ public:
 
 	ExportStatus status(int job_id) const;
 
-	/* Finishes the current file early, drops the queue and joins the worker. Qt thread. */
+	/* Finishes the current file early, drops the queue and joins the workers. Qt thread. */
 	void shutdown();
+
+	/* True once exporting was caught costing the broadcast frames; concurrency drops to one. */
+	bool safe_mode() const { return safe_mode_.load(std::memory_order_acquire); }
 
 private:
 	ClipExporter() = default;
@@ -98,10 +122,14 @@ private:
 		std::string path;
 		std::string encoder; /* resolved: libx264 | h264_nvenc | … */
 		int crf = 18;
+		int thread_budget = 0;
 	};
 
-	void ensure_worker();
+	void ensure_workers();
 	void worker_loop();
+	bool take_job(Job &job);
+	void note_job_started();
+	void note_job_finished();
 	void run(const Job &job);
 	void update(int job_id, ExportState state, uint64_t done, uint64_t total, const std::string &path,
 		    const std::string &error);
@@ -111,7 +139,12 @@ private:
 	std::condition_variable wake_;
 	std::deque<Job> queue_;
 	std::map<int, ExportStatus> statuses_;
-	std::thread worker_;
+	std::vector<std::thread> workers_;
+	int running_jobs_ = 0;
+	uint32_t skipped_at_start_ = 0;
+	uint32_t lagged_at_start_ = 0;
+	std::atomic<int> hardware_jobs_{0};
+	std::atomic<bool> safe_mode_{false};
 	std::atomic<bool> stop_{false};
 	int next_id_ = 1;
 	int sequence_ = 0;

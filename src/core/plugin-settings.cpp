@@ -93,6 +93,18 @@ void PluginSettings::load()
 		obs_data_array_release(list);
 	}
 	export_enabled = obs_data_get_bool(data, "export_enabled");
+	if (obs_data_array_t *saved_angles = obs_data_get_array(data, "export_angles")) {
+		const size_t count = std::min<size_t>(obs_data_array_count(saved_angles), export_angles.size());
+		for (size_t index = 0; index < count; ++index) {
+			obs_data_t *item = obs_data_array_item(saved_angles, index);
+			export_angles[index] = obs_data_get_bool(item, "enabled");
+			obs_data_release(item);
+		}
+		obs_data_array_release(saved_angles);
+	} else {
+		/* Older config: the single switch meant "save the programme". */
+		export_angles = {export_enabled, false, false, false};
+	}
 	export_dir = obs_data_get_string(data, "export_dir");
 	export_encoder = obs_data_get_string(data, "export_encoder");
 	export_crf = static_cast<int>(obs_data_get_int(data, "export_crf"));
@@ -133,6 +145,15 @@ void PluginSettings::save() const
 	obs_data_set_array(data, "cameras", list);
 	obs_data_array_release(list);
 	obs_data_set_bool(data, "export_enabled", export_enabled);
+	obs_data_array_t *angle_list = obs_data_array_create();
+	for (bool enabled : export_angles) {
+		obs_data_t *item = obs_data_create();
+		obs_data_set_bool(item, "enabled", enabled);
+		obs_data_array_push_back(angle_list, item);
+		obs_data_release(item);
+	}
+	obs_data_set_array(data, "export_angles", angle_list);
+	obs_data_array_release(angle_list);
 	obs_data_set_string(data, "export_dir", export_dir.c_str());
 	obs_data_set_string(data, "export_encoder", export_encoder.c_str());
 	obs_data_set_int(data, "export_crf", export_crf);
