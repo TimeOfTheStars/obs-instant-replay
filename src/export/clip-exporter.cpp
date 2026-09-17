@@ -68,45 +68,78 @@ std::string ffmpeg_error(int code)
  * cores the stream encoder needs.
  */
 /*
- * "Compiled in" is not "usable": FFmpeg always reports h264_nvenc when it was built with NVENC
- * support, and on a machine without an NVIDIA driver opening it fails with a bare -1 from the
- * dynamic loader ("Operation not permitted" on Windows). OBS itself only registers its NVENC
- * encoders after probing the hardware, so that registry is the reliable signal.
+ * "Compiled in" is not "usable": FFmpeg reports h264_nvenc / h264_amf / h264_qsv whenever it was
+ * built with them, and on a machine without that vendor's driver opening them fails with a bare
+ * -1 from the dynamic loader ("Operation not permitted" on Windows). OBS itself only registers a
+ * hardware encoder after probing the GPU, so its registry is the reliable signal.
  */
-bool nvidia_encoder_available()
+bool hardware_encoder_available(const char *ffmpeg_name)
 {
-	if (!avcodec_find_encoder_by_name("h264_nvenc"))
+	if (!avcodec_find_encoder_by_name(ffmpeg_name))
 		return false;
 
-	static const char *obs_nvenc_ids[] = {"obs_nvenc_h264_tex", "obs_nvenc_h264_cuda", "jim_nvenc", "ffmpeg_nvenc"};
-	for (const char *id : obs_nvenc_ids) {
-		if (obs_get_encoder_codec(id))
+	static const char *nvenc_ids[] = {"obs_nvenc_h264_tex", "obs_nvenc_h264_cuda", "jim_nvenc", "ffmpeg_nvenc"};
+	static const char *amf_ids[] = {"h264_texture_amf", "h264_fallback_amf"};
+	static const char *qsv_ids[] = {"obs_qsv11_v2", "obs_qsv11", "obs_qsv11_soft"};
+
+	const char *const *ids = nullptr;
+	size_t count = 0;
+	if (strcmp(ffmpeg_name, "h264_nvenc") == 0) {
+		ids = nvenc_ids;
+		count = sizeof(nvenc_ids) / sizeof(nvenc_ids[0]);
+	} else if (strcmp(ffmpeg_name, "h264_amf") == 0) {
+		ids = amf_ids;
+		count = sizeof(amf_ids) / sizeof(amf_ids[0]);
+	} else if (strcmp(ffmpeg_name, "h264_qsv") == 0) {
+		ids = qsv_ids;
+		count = sizeof(qsv_ids) / sizeof(qsv_ids[0]);
+	} else {
+		return true; /* software encoders need no hardware */
+	}
+
+	for (size_t i = 0; i < count; ++i) {
+		if (obs_get_encoder_codec(ids[i]))
 			return true;
 	}
 	return false;
 }
 
+/* FFmpeg encoder for a panel choice (auto | x264 | nvenc | amf | qsv). */
 std::string resolve_encoder(const std::string &requested)
 {
-	const bool have_nvenc = nvidia_encoder_available();
-
 	if (requested == "x264")
 		return "libx264";
 	if (requested == "nvenc")
-		return have_nvenc ? "h264_nvenc" : "libx264";
+		return hardware_encoder_available("h264_nvenc") ? "h264_nvenc" : "libx264";
+	if (requested == "amf")
+		return hardware_encoder_available("h264_amf") ? "h264_amf" : "libx264";
+	if (requested == "qsv")
+		return hardware_encoder_available("h264_qsv") ? "h264_qsv" : "libx264";
 
-	bool stream_uses_nvenc = false;
+	/*
+	 * Auto: stay off whatever the stream is using. A GPU stream leaves the CPU free for x264;
+	 * an x264 stream leaves the GPU free, so take the vendor's encoder OBS has actually probed
+	 * (NVIDIA or AMD or Intel — whichever this machine has).
+	 */
+	bool stream_on_gpu = false;
 	if (config_t *profile = obs_frontend_get_profile_config()) {
 		const char *mode = config_get_string(profile, "Output", "Mode");
 		const bool advanced = mode && strcmp(mode, "Advanced") == 0;
 		const char *encoder = advanced ? config_get_string(profile, "AdvOut", "Encoder")
 					       : config_get_string(profile, "SimpleOutput", "StreamEncoder");
-		stream_uses_nvenc = encoder && strstr(encoder, "nvenc") != nullptr;
+		/* Simple mode: "nvenc", "amd", "qsv"; advanced mode: "obs_nvenc_*", "h264_texture_amf", "obs_qsv11*". */
+		stream_on_gpu = encoder && (strstr(encoder, "nvenc") || strstr(encoder, "amd") ||
+					    strstr(encoder, "amf") || strstr(encoder, "qsv"));
 	}
 
-	if (stream_uses_nvenc || !have_nvenc)
+	if (stream_on_gpu)
 		return "libx264";
-	return "h264_nvenc";
+
+	for (const char *gpu : {"h264_nvenc", "h264_amf", "h264_qsv"}) {
+		if (hardware_encoder_available(gpu))
+			return gpu;
+	}
+	return "libx264";
 }
 
 AVPixelFormat pixel_format_for(video_format format)
@@ -334,8 +367,8 @@ void ClipExporter::run(const Job &job)
 		const AVCodec *candidate = avcodec_find_encoder_by_name(name);
 		if (!candidate)
 			continue;
-		if (strcmp(name, "h264_nvenc") == 0 && !nvidia_encoder_available())
-			continue;
+		if (!hardware_encoder_available(name))
+			continue; /* no point probing a vendor's encoder on a machine without that GPU */
 
 		bool already_tried = false;
 		for (const char *earlier : candidates) {

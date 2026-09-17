@@ -640,7 +640,9 @@ QWidget *ReplayDock::buildExportBox()
 	export_encoder_combo = new QComboBox(box);
 	export_encoder_combo->addItem(obs_module_text("Replay.Export.Encoder.Auto"), QStringLiteral("auto"));
 	export_encoder_combo->addItem(QStringLiteral("x264 (CPU)"), QStringLiteral("x264"));
-	export_encoder_combo->addItem(QStringLiteral("NVENC (GPU)"), QStringLiteral("nvenc"));
+	export_encoder_combo->addItem(QStringLiteral("NVENC (NVIDIA GPU)"), QStringLiteral("nvenc"));
+	export_encoder_combo->addItem(QStringLiteral("AMF (AMD GPU)"), QStringLiteral("amf"));
+	export_encoder_combo->addItem(QStringLiteral("QSV (Intel GPU)"), QStringLiteral("qsv"));
 	const int current = export_encoder_combo->findData(QString::fromStdString(settings.export_encoder));
 	export_encoder_combo->setCurrentIndex(std::max(0, current));
 	connect(export_encoder_combo, &QComboBox::currentIndexChanged, this, &ReplayDock::onSettingsChanged);
