@@ -580,6 +580,380 @@ void ReplayDock::selectAngle3()
 	selectAngle(3);
 }
 
+QWidget *ReplayDock::buildTimelineRow()
+{
+	auto *box = new QWidget(this);
+	auto *layout = new QVBoxLayout(box);
+	layout->setContentsMargins(0, 0, 0, 0);
+	layout->setSpacing(2);
+
+	timeline = new ReplayTimeline(box);
+	connect(timeline, &ReplayTimeline::selectionChanged, this, &ReplayDock::onTimelineChanged);
+
+	timeline_label = new QLabel(obs_module_text("Replay.Timeline.Empty"), box);
+	timeline_label->setEnabled(false);
+
+	layout->addWidget(timeline);
+	layout->addWidget(timeline_label);
+	return box;
+}
+
+QWidget *ReplayDock::buildEventsBox()
+{
+	auto *box = new QGroupBox(obs_module_text("Replay.Events"), this);
+	auto *layout = new QVBoxLayout(box);
+	layout->setContentsMargins(6, 6, 6, 6);
+
+	events_list = new QListWidget(box);
+	events_list->setAlternatingRowColors(true);
+	events_list->setMinimumHeight(90);
+	connect(events_list, &QListWidget::itemDoubleClicked, this, &ReplayDock::onEventActivated);
+	connect(events_list, &QListWidget::currentRowChanged, this, &ReplayDock::onEventSelected);
+	events_list->setContextMenuPolicy(Qt::CustomContextMenu);
+	connect(events_list, &QListWidget::customContextMenuRequested, this, &ReplayDock::onEventsContextMenu);
+	layout->addWidget(events_list);
+
+	auto *hint = new QLabel(obs_module_text("Replay.Events.Hint"), box);
+	hint->setWordWrap(true);
+	hint->setEnabled(false);
+	layout->addWidget(hint);
+	return box;
+}
+
+QWidget *ReplayDock::buildExportBox()
+{
+	auto *box = new QGroupBox(obs_module_text("Replay.Export"), this);
+	auto *layout = new QVBoxLayout(box);
+	layout->setContentsMargins(6, 6, 6, 6);
+	layout->setSpacing(4);
+
+	const PluginSettings &settings = PluginSettings::instance();
+
+	export_check = new QCheckBox(obs_module_text("Replay.Export.Enabled"), box);
+	export_check->setChecked(settings.export_enabled);
+	connect(export_check, &QCheckBox::toggled, this, &ReplayDock::onSettingsChanged);
+
+	auto *folder_row = new QHBoxLayout();
+	export_dir_edit = new QLineEdit(QString::fromStdString(settings.export_dir), box);
+	export_dir_edit->setPlaceholderText(obs_module_text("Replay.Export.DefaultFolder"));
+	connect(export_dir_edit, &QLineEdit::editingFinished, this, &ReplayDock::onSettingsChanged);
+	auto *browse = new QPushButton(QStringLiteral("…"), box);
+	browse->setFixedWidth(32);
+	connect(browse, &QPushButton::clicked, this, [this] {
+		const QString chosen = QFileDialog::getExistingDirectory(
+			this, obs_module_text("Replay.Export.ChooseFolder"), export_dir_edit->text());
+		if (!chosen.isEmpty()) {
+			export_dir_edit->setText(chosen);
+			onSettingsChanged();
+		}
+	});
+	folder_row->addWidget(export_dir_edit, 1);
+	folder_row->addWidget(browse);
+
+	auto *encoder_row = new QHBoxLayout();
+	encoder_row->addWidget(new QLabel(obs_module_text("Replay.Export.Encoder"), box));
+	export_encoder_combo = new QComboBox(box);
+	export_encoder_combo->addItem(obs_module_text("Replay.Export.Encoder.Auto"), QStringLiteral("auto"));
+	export_encoder_combo->addItem(QStringLiteral("x264 (CPU)"), QStringLiteral("x264"));
+	export_encoder_combo->addItem(QStringLiteral("NVENC (NVIDIA GPU)"), QStringLiteral("nvenc"));
+	export_encoder_combo->addItem(QStringLiteral("AMF (AMD GPU)"), QStringLiteral("amf"));
+	export_encoder_combo->addItem(QStringLiteral("QSV (Intel GPU)"), QStringLiteral("qsv"));
+	const int current = export_encoder_combo->findData(QString::fromStdString(settings.export_encoder));
+	export_encoder_combo->setCurrentIndex(std::max(0, current));
+	connect(export_encoder_combo, &QComboBox::currentIndexChanged, this, &ReplayDock::onSettingsChanged);
+	encoder_row->addWidget(export_encoder_combo, 1);
+
+	/* Which angles MARK writes: one narrow checkbox each, so the row fits a 320 px dock. */
+	auto *angles_row = new QHBoxLayout();
+	angles_row->addWidget(new QLabel(obs_module_text("Replay.Export.Angles"), box));
+	for (int angle = 0; angle < kAngleCount; ++angle) {
+		const QString label = angle == kProgramAngle ? QString(obs_module_text("Replay.Angle.Short.Program"))
+							     : QString::number(angle);
+		auto *check = new QCheckBox(label, box);
+		check->setChecked(settings.export_angles[static_cast<size_t>(angle)]);
+		connect(check, &QCheckBox::toggled, this, &ReplayDock::onExportAnglesChanged);
+		export_angle_checks[static_cast<size_t>(angle)] = check;
+		angles_row->addWidget(check);
+	}
+	angles_row->addStretch(1);
+
+	layout->addWidget(export_check);
+	layout->addLayout(angles_row);
+	layout->addLayout(folder_row);
+	layout->addLayout(encoder_row);
+	return box;
+}
+
+QWidget *ReplayDock::buildTransportRow()
+{
+	auto *box = new QWidget(this);
+	auto *outer = new QVBoxLayout(box);
+	outer->setContentsMargins(0, 0, 0, 0);
+	outer->setSpacing(6);
+
+	auto *row = new QHBoxLayout();
+	play_button = new QPushButton(obs_module_text("Replay.Play"), box);
+	play_button->setMinimumHeight(40);
+	stop_button = new QPushButton(obs_module_text("Replay.Stop"), box);
+	stop_button->setMinimumHeight(40);
+	connect(play_button, &QPushButton::clicked, this, &ReplayDock::onPlay);
+	connect(stop_button, &QPushButton::clicked, this, &ReplayDock::onStop);
+
+	row->addWidget(play_button, 3);
+	row->addWidget(stop_button, 1);
+
+	auto_return_check = new QCheckBox(obs_module_text("Replay.AutoReturn"), box);
+	auto_return_check->setChecked(PluginSettings::instance().auto_return);
+	connect(auto_return_check, &QCheckBox::toggled, this, &ReplayDock::onSettingsChanged);
+
+	outer->addLayout(row);
+	outer->addWidget(auto_return_check);
+	return box;
+}
+
+void ReplayDock::onMark()
+{
+	Clip clip;
+	std::string error;
+	if (!PlaybackEngine::instance().mark(length_spin->value(), offset_spin->value(), clip, error)) {
+		obs_log(LOG_WARNING, "MARK failed: %s", error.c_str());
+		format_label->setText(QString::fromStdString(error));
+		return;
+	}
+
+	Event event;
+	event.clip = clip;
+	event.name = QStringLiteral("%1 %2").arg(obs_module_text("Replay.Event")).arg(events.size() + 1);
+	const PluginSettings &settings = PluginSettings::instance();
+	if (settings.export_enabled) {
+		AngleManager &angles = AngleManager::instance();
+
+		/* Decide the whole set first: the thread budget depends on how many angles are queued. */
+		std::vector<int> queued;
+		for (int angle = 0; angle < kAngleCount; ++angle) {
+			if (!settings.export_angles[static_cast<size_t>(angle)])
+				continue;
+			if (!angles.angle(angle).running())
+				continue;
+			queued.push_back(angle);
+		}
+
+		std::string stem;
+		std::string path_error;
+		if (queued.empty()) {
+			/* Nothing ticked, or the ticked cameras are not buffering — say so instead of staying mute. */
+			obs_log(LOG_WARNING, "export: no angle available to save");
+		} else if (!build_export_stem(export_base_directory(settings.export_dir), event.name.toStdString(),
+					      ClipExporter::instance().reserve_sequence(), stem, path_error)) {
+			obs_log(LOG_WARNING, "export: %s", path_error.c_str());
+			format_label->setText(QString::fromStdString(path_error));
+		} else {
+			/*
+			 * Split x264 threads across the jobs, otherwise three exports would each grab half the
+			 * machine and starve the encoder that is feeding the broadcast.
+			 */
+			const int budget = std::max(2, os_get_logical_cores() / 2);
+			const int program_threads = std::max(2, budget / 2);
+			const int camera_jobs =
+				static_cast<int>(queued.size()) -
+				(std::find(queued.begin(), queued.end(), kProgramAngle) != queued.end() ? 1 : 0);
+			const int camera_threads =
+				camera_jobs > 0 ? std::max(1, (budget - program_threads) / camera_jobs) : 0;
+
+			for (int angle : queued) {
+				ExportOptions options;
+				options.encoder = settings.export_encoder;
+				options.crf = settings.export_crf;
+				options.thread_budget = angle == kProgramAngle ? program_threads : camera_threads;
+
+				EventAngle &slot = event.angles[static_cast<size_t>(angle)];
+				slot.requested = true;
+				slot.path = export_angle_file(stem, angle);
+				slot.state = ExportState::Queued;
+				slot.job = ClipExporter::instance().enqueue(angle, clip, slot.path, options);
+			}
+			event.all_terminal = false;
+		}
+	}
+
+	events.push_back(event);
+
+	auto *item = new QListWidgetItem();
+	item->setData(Qt::UserRole, static_cast<int>(events.size()) - 1);
+	events_list->addItem(item);
+	updateEventItem(static_cast<int>(events.size()) - 1);
+	events_list->setCurrentItem(item);
+	showSelection(static_cast<int>(events.size()) - 1);
+
+	obs_log(LOG_INFO, "marked clip %.1f s (%llu frames)", clip.duration_sec(),
+		static_cast<unsigned long long>(clip.seq_out - clip.seq_in));
+}
+
+void ReplayDock::updateEventItem(int event_index)
+{
+	if (event_index < 0 || event_index >= static_cast<int>(events.size()))
+		return;
+
+	for (int row = 0; row < events_list->count(); ++row) {
+		QListWidgetItem *item = events_list->item(row);
+		if (item->data(Qt::UserRole).toInt() != event_index)
+			continue;
+
+		const Event &event = events[static_cast<size_t>(event_index)];
+		QString text = QStringLiteral("%1   %2 s").arg(event.name).arg(event.clip.duration_sec(), 0, 'f', 1);
+
+		/*
+		 * At 320 px the row fits roughly 42 characters, so the per-angle state is glyphs only and
+		 * the words live in the tooltip.
+		 */
+		QString strip;
+		QString tooltip;
+		int percent = -1;
+		for (int angle = 0; angle < kAngleCount; ++angle) {
+			const EventAngle &slot = event.angles[static_cast<size_t>(angle)];
+			if (!slot.requested)
+				continue;
+
+			const QString label = angle == kProgramAngle
+						      ? QString(obs_module_text("Replay.Angle.Short.Program"))
+						      : QString::number(angle);
+			QString glyph;
+			QString words;
+			switch (slot.state) {
+			case ExportState::Queued:
+				glyph = QStringLiteral("·");
+				words = obs_module_text("Replay.Export.Queued");
+				break;
+			case ExportState::Encoding: {
+				glyph = QStringLiteral("◐");
+				words = obs_module_text("Replay.Export.Saving");
+				const ExportStatus status = ClipExporter::instance().status(slot.job);
+				if (status.frames_total > 0) {
+					const int done =
+						static_cast<int>(status.frames_done * 100 / status.frames_total);
+					percent = percent < 0 ? done : std::min(percent, done);
+				}
+				break;
+			}
+			case ExportState::Done:
+				glyph = QStringLiteral("✓");
+				words = obs_module_text("Replay.Export.Saved");
+				break;
+			case ExportState::DoneTruncated:
+				glyph = QStringLiteral("≈");
+				words = obs_module_text("Replay.Export.SavedTruncated");
+				break;
+			case ExportState::Failed:
+				glyph = QStringLiteral("✗");
+				words = QString::fromStdString(ClipExporter::instance().status(slot.job).error);
+				break;
+			}
+
+			strip += QStringLiteral(" %1%2").arg(label).arg(glyph);
+			tooltip += QStringLiteral("%1 %2 — %3\n")
+					   .arg(obs_module_text("Replay.Angle.Word"))
+					   .arg(angle == kProgramAngle
+							? QString(obs_module_text("Replay.Angle.Program"))
+							: QString::number(angle))
+					   .arg(words);
+			if (!slot.path.empty())
+				tooltip += QStringLiteral("    %1\n").arg(QString::fromStdString(slot.path));
+		}
+
+		if (!strip.isEmpty()) {
+			text += QStringLiteral("  ") + strip.trimmed();
+			if (percent >= 0)
+				text += QStringLiteral(" %1%").arg(percent);
+			item->setToolTip(tooltip.trimmed());
+		}
+
+		item->setText(text);
+		return;
+	}
+}
+
+void ReplayDock::showSelection(int event_index)
+{
+	if (event_index < 0 || event_index >= static_cast<int>(events.size())) {
+		timeline->clearSelection();
+		timeline_label->setText(obs_module_text("Replay.Timeline.Empty"));
+		return;
+	}
+
+	uint64_t live = 0;
+	if (!PlaybackEngine::live_timestamp(live))
+		return;
+
+	const Clip &clip = events[static_cast<size_t>(event_index)].clip;
+	/* The timeline axis is "seconds before the live edge", so the clip drifts left as it ages. */
+	const double in_sec = live > clip.ts_in ? static_cast<double>(live - clip.ts_in) / 1e9 : 0.0;
+	const double out_sec = live > clip.ts_out ? static_cast<double>(live - clip.ts_out) / 1e9 : 0.0;
+	timeline->setSelection(in_sec, out_sec);
+
+	timeline_label->setText(QStringLiteral("IN -%1 s   OUT -%2 s   %3 %4 s")
+					.arg(in_sec, 0, 'f', 1)
+					.arg(out_sec, 0, 'f', 1)
+					.arg(obs_module_text("Replay.Timeline.Duration"))
+					.arg(clip.duration_sec(), 0, 'f', 1));
+}
+
+void ReplayDock::rebuildEventList()
+{
+	events_list->clear();
+	for (size_t index = 0; index < events.size(); ++index) {
+		auto *item = new QListWidgetItem();
+		item->setData(Qt::UserRole, static_cast<int>(index));
+		events_list->addItem(item);
+		updateEventItem(static_cast<int>(index));
+	}
+}
+
+void ReplayDock::onEventsContextMenu(const QPoint &position)
+{
+	if (selectedEvent() < 0)
+		return;
+
+	QMenu menu(this);
+	QAction *rename = menu.addAction(obs_module_text("Replay.Event.Rename"));
+	QAction *remove = menu.addAction(obs_module_text("Replay.Event.Delete"));
+
+	const QAction *chosen = menu.exec(events_list->mapToGlobal(position));
+	if (chosen == rename)
+		renameSelectedEvent();
+	else if (chosen == remove)
+		deleteSelectedEvent();
+}
+
+void ReplayDock::renameSelectedEvent()
+{
+	const int index = selectedEvent();
+	if (index < 0 || index >= static_cast<int>(events.size()))
+		return;
+
+	bool accepted = false;
+	const QString name = QInputDialog::getText(this, obs_module_text("Replay.Event.Rename"),
+						   obs_module_text("Replay.Event.Name"), QLineEdit::Normal,
+						   events[static_cast<size_t>(index)].name, &accepted);
+	if (!accepted || name.isEmpty())
+		return;
+
+	events[static_cast<size_t>(index)].name = name;
+	updateEventItem(index);
+}
+
+void ReplayDock::deleteSelectedEvent()
+{
+	const int index = selectedEvent();
+	if (index < 0 || index >= static_cast<int>(events.size()))
+		return;
+
+	events.erase(events.begin() + index);
+
+	/* Item payloads are plain indices, so the whole list is rebuilt after a removal. */
+	rebuildEventList();
+	showSelection(selectedEvent());
+}
+
 void ReplayDock::updateAngleButtons()
 {
 	AngleManager &angles = AngleManager::instance();
