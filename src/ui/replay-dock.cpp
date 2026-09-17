@@ -44,6 +44,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QLabel>
 #include <QListWidget>
 #include <QProgressBar>
+#include <QScrollArea>
 #include <QPushButton>
 #include <QTimer>
 #include <QAction>
@@ -87,9 +88,26 @@ QLabel *makeBadge(const QString &text)
 
 ReplayDock::ReplayDock(QWidget *parent) : QWidget(parent)
 {
-	auto *layout = new QVBoxLayout(this);
+	/*
+	 * The panel is taller than a docked column usually is, and without a scroll area Qt simply
+	 * squeezes the lower groups out of reach — including the camera pickers the angle buttons
+	 * depend on.
+	 */
+	auto *outer = new QVBoxLayout(this);
+	outer->setContentsMargins(0, 0, 0, 0);
+	outer->setSpacing(0);
+
+	auto *content = new QWidget(this);
+	auto *layout = new QVBoxLayout(content);
 	layout->setContentsMargins(8, 8, 8, 8);
 	layout->setSpacing(8);
+
+	auto *scroll = new QScrollArea(this);
+	scroll->setWidget(content);
+	scroll->setWidgetResizable(true);
+	scroll->setFrameShape(QFrame::NoFrame);
+	scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	outer->addWidget(scroll);
 
 	layout->addWidget(buildStatusRow());
 	layout->addWidget(buildCaptureRow());
@@ -464,8 +482,16 @@ void ReplayDock::onCameraSettingsChanged()
 	}
 	save_timer->start();
 
-	/* Cameras never hold clips of their own, so restarting them costs nothing but a refill. */
-	AngleManager::instance().start_cameras_from_settings();
+	/*
+	 * Every ring is restarted with one budget-fitted duration, so changing the camera set
+	 * reallocates the programme ring too — marked clips point into memory that is about to go.
+	 */
+	ReplayDirector::instance().reset();
+	events.clear();
+	rebuildEventList();
+	showSelection(-1);
+
+	AngleManager::instance().start_from_settings();
 	updateMemoryLabel();
 }
 
@@ -493,7 +519,7 @@ void ReplayDock::updateMemoryLabel()
 			required += ring_bytes(camera_width, camera_height, ovi.output_format, fps, divisor, seconds);
 	}
 
-	const uint64_t budget = AngleManager::memory_budget();
+	const uint64_t budget = AngleManager::instance().memory_budget();
 	const double gib = 1024.0 * 1024.0 * 1024.0;
 	memory_label->setText(QStringLiteral("%1 %2 GB   ·   %3 %4 GB")
 				      .arg(obs_module_text("Replay.Angles.Memory.Required"))
@@ -504,6 +530,14 @@ void ReplayDock::updateMemoryLabel()
 	/* Palette colours everywhere else; red is the one exception an operator must not miss. */
 	memory_label->setStyleSheet(required > budget ? QStringLiteral("color: #e04040; font-weight: bold;")
 						      : QString());
+
+	/* When the budget cannot hold the requested seconds, every ring is shortened equally. */
+	const double fitted = AngleManager::instance().fit_duration(seconds);
+	if (fitted + 0.05 < seconds)
+		memory_label->setText(memory_label->text() +
+				      QStringLiteral("   ·   %1 %2 s")
+					      .arg(obs_module_text("Replay.Angles.Memory.Trimmed"))
+					      .arg(fitted, 0, 'f', 1));
 }
 
 void ReplayDock::onAngleClicked(int angle)
@@ -622,6 +656,7 @@ QWidget *ReplayDock::buildEventsBox()
 
 	events_list = new QListWidget(box);
 	events_list->setAlternatingRowColors(true);
+	events_list->setMinimumHeight(90);
 	connect(events_list, &QListWidget::itemDoubleClicked, this, &ReplayDock::onEventActivated);
 	connect(events_list, &QListWidget::currentRowChanged, this, &ReplayDock::onEventSelected);
 	events_list->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -1008,7 +1043,6 @@ void ReplayDock::applyBufferSetting()
 	rebuildEventList();
 	showSelection(-1);
 
-	AngleManager::instance().stop_all();
 	AngleManager::instance().start_from_settings();
 }
 

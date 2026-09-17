@@ -52,12 +52,21 @@ class AngleManager {
 public:
 	static AngleManager &instance();
 
-	/* Starts the programme ring and every enabled camera from the saved settings. */
+	/*
+	 * Restarts every ring from the saved settings. All rings get the same duration on purpose: a
+	 * camera ring shorter than the programme one cannot serve older clips, which makes its angle
+	 * button dead weight.
+	 */
 	void start_from_settings();
-	void start_cameras_from_settings();
 
 	/* Programme buffer. */
 	bool start_program(double duration_sec, uint32_t frame_rate_divisor);
+
+	/* Seconds that fit the memory budget for the current set of rings; <= wanted. */
+	double fit_duration(double wanted_sec) const;
+
+	/* Duration the rings were actually started with. */
+	double active_duration() const { return program_duration_; }
 
 	/* Cameras: (re)bind a scene and start its tap; stop_camera releases the ring. */
 	bool start_camera(int camera, const CameraBinding &binding, uint32_t height, double duration_sec,
@@ -86,8 +95,8 @@ public:
 	/* Qt timer: rebuilds after video setting changes, notices deleted camera scenes. */
 	void poll();
 
-	/* Memory the rings may take in total; half of what is free right now. */
-	static uint64_t memory_budget();
+	/* Memory all rings together may take. */
+	uint64_t memory_budget() const;
 
 private:
 	AngleManager();
@@ -103,5 +112,7 @@ private:
 	std::atomic<int> active_angle_{kProgramAngle};
 
 	obs_weak_source_t *resolve_scene(const CameraBinding &binding, std::string &resolved_name) const;
-	uint64_t camera_budget() const;
+	bool start_camera_internal(int camera, const CameraBinding &binding, uint32_t height, double duration_sec,
+				   uint32_t frame_rate_divisor);
+	uint64_t allocated_bytes() const;
 };

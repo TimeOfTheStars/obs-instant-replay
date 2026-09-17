@@ -72,7 +72,7 @@ static void on_frontend_event(enum obs_frontend_event event, void *)
 		AngleManager::instance().stop_cameras();
 		break;
 	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
-		AngleManager::instance().start_cameras_from_settings();
+		AngleManager::instance().start_from_settings();
 		if (dock_widget)
 			dock_widget->refreshSceneList();
 		break;

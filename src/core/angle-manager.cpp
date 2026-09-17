@@ -42,40 +42,70 @@ AngleManager::AngleManager()
 		angle = std::make_unique<AngleCapture>(teardown_);
 }
 
-uint64_t AngleManager::memory_budget()
+uint64_t AngleManager::allocated_bytes() const
+{
+	uint64_t total = 0;
+	for (const auto &angle : angles_)
+		total += angle->running() ? angle->ring().bytes_allocated() : 0;
+	return total;
+}
+
+uint64_t AngleManager::memory_budget() const
 {
 	const uint64_t available = available_physical_memory();
 	if (available == 0)
 		return 2048ull * 1024ull * 1024ull; /* unknown: stay conservative at 2 GiB */
 
-	/* Never take more than half of what is free: OBS, browser sources and Windows need room. */
-	return available / 2;
+	/*
+	 * Our own rings are already subtracted from "available", so they have to be added back —.
+	 * otherwise every restart measures a machine that looks emptier than it is and the budget
+	 * spirals down until the cameras get crumbs.
+	 */
+	return (available + allocated_bytes()) / 2;
 }
 
-uint64_t AngleManager::camera_budget() const
+double AngleManager::fit_duration(double wanted_sec) const
 {
-	const uint64_t total = memory_budget();
-	const uint64_t used_by_program = program().running() ? program().ring().bytes_allocated() : 0;
-	const uint64_t remaining = total > used_by_program ? total - used_by_program : 0;
+	obs_video_info ovi = {};
+	if (!obs_get_video_info(&ovi) || ovi.fps_den == 0)
+		return wanted_sec;
 
-	int enabled = 0;
-	for (const auto &binding : bindings_)
-		enabled += binding.enabled ? 1 : 0;
+	const PluginSettings &settings = PluginSettings::instance();
+	const double fps = static_cast<double>(ovi.fps_num) / ovi.fps_den;
+	const uint32_t divisor = std::max<uint32_t>(1, settings.frame_rate_divisor);
 
-	return enabled > 0 ? remaining / enabled : remaining;
+	uint64_t per_second = ring_bytes(ovi.output_width, ovi.output_height, ovi.output_format, fps, divisor, 1.0);
+
+	const uint32_t camera_height = std::min(settings.camera_height, ovi.base_height);
+	const uint32_t camera_width = camera_width_for_height(ovi.base_width, ovi.base_height, camera_height);
+	for (const CameraBinding &binding : settings.cameras) {
+		if (binding.enabled)
+			per_second += ring_bytes(camera_width, camera_height, ovi.output_format, fps, divisor, 1.0);
+	}
+
+	if (per_second == 0)
+		return wanted_sec;
+
+	const double affordable = static_cast<double>(memory_budget()) / per_second;
+	/* Below three seconds a replay is not worth showing; let the allocation fail loudly instead. */
+	return std::max(3.0, std::min(wanted_sec, affordable));
 }
 
 void AngleManager::start_from_settings()
 {
-	const PluginSettings &settings = PluginSettings::instance();
-	if (!start_program(settings.buffer_seconds, settings.frame_rate_divisor))
-		obs_log(LOG_WARNING, "replay buffer is not running");
-	start_cameras_from_settings();
-}
-
-void AngleManager::start_cameras_from_settings()
-{
 	PluginSettings &settings = PluginSettings::instance();
+
+	PlaybackEngine::instance().stop();
+	stop_all();
+
+	const double duration = fit_duration(settings.buffer_seconds);
+	if (duration + 0.05 < settings.buffer_seconds)
+		obs_log(LOG_WARNING, "buffers trimmed to %.1f s (asked for %.1f s): %llu MiB budget for all rings",
+			duration, settings.buffer_seconds,
+			static_cast<unsigned long long>(memory_budget() / (1024ull * 1024ull)));
+
+	if (!start_program(duration, settings.frame_rate_divisor))
+		obs_log(LOG_WARNING, "replay buffer is not running");
 
 	/* Scene uuids only mean something inside the collection they were picked in. */
 	std::string collection;
@@ -89,8 +119,7 @@ void AngleManager::start_cameras_from_settings()
 		CameraBinding binding = settings.cameras[static_cast<size_t>(camera)];
 		if (!same_collection)
 			binding.uuid.clear(); /* fall back to the scene name in a different collection */
-		start_camera(camera, binding, settings.camera_height, settings.buffer_seconds,
-			     settings.frame_rate_divisor);
+		start_camera_internal(camera, binding, settings.camera_height, duration, settings.frame_rate_divisor);
 	}
 }
 
@@ -144,6 +173,12 @@ obs_weak_source_t *AngleManager::resolve_scene(const CameraBinding &binding, std
 bool AngleManager::start_camera(int camera, const CameraBinding &binding, uint32_t height, double duration_sec,
 				uint32_t frame_rate_divisor)
 {
+	return start_camera_internal(camera, binding, height, duration_sec, frame_rate_divisor);
+}
+
+bool AngleManager::start_camera_internal(int camera, const CameraBinding &binding, uint32_t height, double duration_sec,
+					 uint32_t frame_rate_divisor)
+{
 	if (camera < 0 || camera >= kCameraCount)
 		return false;
 
@@ -176,8 +211,18 @@ bool AngleManager::start_camera(int camera, const CameraBinding &binding, uint32
 		request.output_width = camera_width_for_height(ovi.base_width, ovi.base_height, height);
 	}
 
+	/*
+	 * The duration was already fitted to the budget for the whole set of rings, so the cap here is
+	 * just this ring's own requirement — it must not trim the camera below the programme.
+	 */
+	const uint32_t requested_height = request.output_height ? request.output_height : ovi.output_height;
+	const uint32_t requested_width = request.output_width ? request.output_width : ovi.output_width;
+	const double fps = ovi.fps_den ? static_cast<double>(ovi.fps_num) / ovi.fps_den : 0.0;
+	const uint64_t cap = ring_bytes(requested_width, requested_height, ovi.output_format, fps,
+					std::max<uint32_t>(1, frame_rate_divisor), duration_sec);
+
 	AngleCapture &capture = angle(camera + 1);
-	if (!capture.start(std::make_unique<ViewTap>(), request, duration_sec, camera_budget())) {
+	if (!capture.start(std::make_unique<ViewTap>(), request, duration_sec, cap)) {
 		camera_errors_[static_cast<size_t>(camera)] = capture.error();
 		obs_log(LOG_ERROR, "camera %d ('%s'): %s", camera + 1, resolved_name.c_str(), capture.error().c_str());
 		return false;
