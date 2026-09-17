@@ -17,7 +17,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "playback-engine.hpp"
-#include "program-capture.hpp"
+#include "angle-manager.hpp"
 
 #include <obs.h>
 
@@ -46,7 +46,7 @@ PlaybackEngine &PlaybackEngine::instance()
 
 bool PlaybackEngine::mark(double length_sec, double trim_sec, Clip &clip, std::string &error) const
 {
-	ProgramCapture &capture = ProgramCapture::instance();
+	const AngleCapture &capture = AngleManager::instance().program();
 	if (!capture.running()) {
 		error = "buffer is not running";
 		return false;
@@ -108,7 +108,7 @@ bool PlaybackEngine::mark(double length_sec, double trim_sec, Clip &clip, std::s
 
 bool PlaybackEngine::clip_from_timestamps(uint64_t ts_in, uint64_t ts_out, Clip &clip, std::string &error) const
 {
-	ProgramCapture &capture = ProgramCapture::instance();
+	const AngleCapture &capture = AngleManager::instance().program();
 	if (!capture.running()) {
 		error = "buffer is not running";
 		return false;
@@ -151,16 +151,7 @@ bool PlaybackEngine::clip_from_timestamps(uint64_t ts_in, uint64_t ts_out, Clip 
 
 bool PlaybackEngine::live_timestamp(uint64_t &timestamp)
 {
-	ProgramCapture &capture = ProgramCapture::instance();
-	if (!capture.running())
-		return false;
-
-	const FrameRing &ring = capture.ring();
-	const uint64_t head = ring.head();
-	if (head == 0)
-		return false;
-
-	return ring.timestamp_at(head - 1, timestamp);
+	return AngleManager::instance().program().live_timestamp(timestamp);
 }
 
 bool PlaybackEngine::play(const Clip &clip, double speed)
@@ -183,6 +174,16 @@ void PlaybackEngine::stop()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	playing_ = false;
+}
+
+void PlaybackEngine::set_angle(int angle)
+{
+	AngleManager::instance().set_active_angle(angle);
+}
+
+int PlaybackEngine::angle() const
+{
+	return AngleManager::instance().active_angle();
 }
 
 void PlaybackEngine::set_speed(double speed)
@@ -251,9 +252,29 @@ FramePick PlaybackEngine::next_frame()
 		return pick;
 	}
 
-	const FrameRing &ring = ProgramCapture::instance().ring();
+	/*
+	 * Cameras are looked up by timestamp within their own ring; clip sequence numbers only mean
+	 * something in the programme ring. A camera that does not cover this instant falls back to
+	 * the programme picture instead of freezing the replay.
+	 */
+	AngleManager &angles = AngleManager::instance();
+	const uint64_t wanted_ts = clip_.ts_in + position;
+	int angle = angles.active_angle();
+	if (angle != kProgramAngle && !angles.angle(angle).covers(wanted_ts))
+		angle = kProgramAngle;
+
+	const FrameRing &ring = angles.angle(angle).ring();
 	uint64_t seq = 0;
-	if (!ring.find_by_timestamp(clip_.ts_in + position, clip_.seq_in, clip_.seq_out, seq)) {
+	bool found;
+	if (angle == kProgramAngle) {
+		found = ring.find_by_timestamp(wanted_ts, clip_.seq_in, clip_.seq_out, seq);
+	} else {
+		const uint64_t head = ring.head();
+		found = head > 0 &&
+			ring.find_by_timestamp(wanted_ts, std::max(ring.oldest(), ring.gap_seq()), head - 1, seq);
+	}
+
+	if (!found) {
 		/* The clip fell out of the ring (only possible while recording keeps running). */
 		playing_ = false;
 		pick.finished = true;
@@ -264,12 +285,14 @@ FramePick PlaybackEngine::next_frame()
 	 * Below 100 % the same source frame covers several ticks. Emitting it once is enough: the
 	 * async source keeps showing the last frame, and skipping saves a full frame copy per tick.
 	 */
-	if (has_emitted_ && seq == last_emitted_seq_)
+	if (has_emitted_ && seq == last_emitted_seq_ && angle == last_emitted_angle_)
 		return pick;
 
 	if (!ring.read(seq, pick.meta, pick.planes))
 		return pick;
 
+	pick.format = ring.config().format;
+	last_emitted_angle_ = angle;
 	last_emitted_seq_ = seq;
 	has_emitted_ = true;
 	pick.has_frame = true;

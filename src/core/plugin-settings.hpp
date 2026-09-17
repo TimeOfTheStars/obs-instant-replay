@@ -18,6 +18,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #pragma once
 
+#include "angle-manager.hpp"
+
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -37,6 +40,11 @@ struct PluginSettings {
 	double clip_trim_sec = 0.0;
 	int speed_percent = 100;
 	bool auto_return = true;
+
+	/* Cameras: scenes buffered alongside the programme, valid within one scene collection. */
+	std::array<CameraBinding, kCameraCount> cameras;
+	uint32_t camera_height = 720; /* 540 / 720 / 1080 */
+	std::string scene_collection;
 
 	/* Export: every MARK writes the programme clip to <export_dir>/<YYYY-MM-DD>/ */
 	bool export_enabled = true;

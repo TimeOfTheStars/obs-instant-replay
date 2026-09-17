@@ -18,7 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "clip-exporter.hpp"
 
-#include "core/program-capture.hpp"
+#include "core/angle-manager.hpp"
 #include "export-path.hpp"
 
 #include <obs-frontend-api.h>
@@ -250,7 +250,8 @@ void ClipExporter::run(const Job &job)
 	const uint64_t total = job.clip.seq_out - job.clip.seq_in;
 	update(job.id, ExportState::Encoding, 0, total, "", "");
 
-	ProgramCapture &capture = ProgramCapture::instance();
+	AngleManager &angles = AngleManager::instance();
+	const AngleCapture &capture = angles.program();
 	if (!capture.running()) {
 		update(job.id, ExportState::Failed, 0, total, "", "buffer is not running");
 		return;
@@ -266,8 +267,8 @@ void ClipExporter::run(const Job &job)
 
 	obs_video_info ovi = {};
 	obs_get_video_info(&ovi);
-	const uint32_t divisor = std::max<uint32_t>(1, capture.settings().frame_rate_divisor);
-	const AVRational time_base = {static_cast<int>(ovi.fps_den * divisor), static_cast<int>(ovi.fps_num)};
+	/* The ring's own rate already accounts for any frame decimation. */
+	const AVRational time_base = av_d2q(1.0 / std::max(config.fps, 1.0), 100000);
 
 	std::string path;
 	std::string error;
@@ -397,7 +398,7 @@ void ClipExporter::run(const Job &job)
 		bool valid = false;
 		{
 			/* Per frame, not per clip: a profile switch must not wait seconds for us. */
-			const auto guard = capture.reader_guard();
+			const auto guard = angles.reader_guard();
 			FrameMeta meta;
 			const uint8_t *planes[MAX_AV_PLANES] = {};
 			if (capture.running() && ring.read(seq, meta, planes) &&

@@ -22,6 +22,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <plugin-support.h>
 #include <util/platform.h>
 
+#include <algorithm>
 #include <string>
 
 namespace {
@@ -65,6 +66,8 @@ void PluginSettings::load()
 	obs_data_set_default_double(data, "clip_trim_sec", clip_trim_sec);
 	obs_data_set_default_int(data, "speed_percent", speed_percent);
 	obs_data_set_default_bool(data, "auto_return", auto_return);
+	obs_data_set_default_int(data, "camera_height", camera_height);
+	obs_data_set_default_string(data, "scene_collection", scene_collection.c_str());
 	obs_data_set_default_bool(data, "export_enabled", export_enabled);
 	obs_data_set_default_string(data, "export_dir", export_dir.c_str());
 	obs_data_set_default_string(data, "export_encoder", export_encoder.c_str());
@@ -76,6 +79,19 @@ void PluginSettings::load()
 	clip_trim_sec = obs_data_get_double(data, "clip_trim_sec");
 	speed_percent = static_cast<int>(obs_data_get_int(data, "speed_percent"));
 	auto_return = obs_data_get_bool(data, "auto_return");
+	camera_height = static_cast<uint32_t>(obs_data_get_int(data, "camera_height"));
+	scene_collection = obs_data_get_string(data, "scene_collection");
+	if (obs_data_array_t *list = obs_data_get_array(data, "cameras")) {
+		const size_t count = std::min<size_t>(obs_data_array_count(list), cameras.size());
+		for (size_t index = 0; index < count; ++index) {
+			obs_data_t *item = obs_data_array_item(list, index);
+			cameras[index].enabled = obs_data_get_bool(item, "enabled");
+			cameras[index].uuid = obs_data_get_string(item, "uuid");
+			cameras[index].name = obs_data_get_string(item, "name");
+			obs_data_release(item);
+		}
+		obs_data_array_release(list);
+	}
 	export_enabled = obs_data_get_bool(data, "export_enabled");
 	export_dir = obs_data_get_string(data, "export_dir");
 	export_encoder = obs_data_get_string(data, "export_encoder");
@@ -103,6 +119,19 @@ void PluginSettings::save() const
 	obs_data_set_double(data, "clip_trim_sec", clip_trim_sec);
 	obs_data_set_int(data, "speed_percent", speed_percent);
 	obs_data_set_bool(data, "auto_return", auto_return);
+	obs_data_set_int(data, "camera_height", camera_height);
+	obs_data_set_string(data, "scene_collection", scene_collection.c_str());
+	obs_data_array_t *list = obs_data_array_create();
+	for (const CameraBinding &camera : cameras) {
+		obs_data_t *item = obs_data_create();
+		obs_data_set_bool(item, "enabled", camera.enabled);
+		obs_data_set_string(item, "uuid", camera.uuid.c_str());
+		obs_data_set_string(item, "name", camera.name.c_str());
+		obs_data_array_push_back(list, item);
+		obs_data_release(item);
+	}
+	obs_data_set_array(data, "cameras", list);
+	obs_data_array_release(list);
 	obs_data_set_bool(data, "export_enabled", export_enabled);
 	obs_data_set_string(data, "export_dir", export_dir.c_str());
 	obs_data_set_string(data, "export_encoder", export_encoder.c_str());

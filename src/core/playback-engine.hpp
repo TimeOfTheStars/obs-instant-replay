@@ -43,6 +43,7 @@ struct FramePick {
 	bool has_frame = false;
 	bool finished = false; /* playback reached the out point */
 	FrameMeta meta;
+	video_format format = VIDEO_FORMAT_NONE;
 	const uint8_t *planes[MAX_AV_PLANES] = {};
 };
 
@@ -67,6 +68,13 @@ public:
 	void stop();
 	void set_speed(double speed);
 
+	/*
+	 * Switches the ring frames are read from. Position is a time offset, and every ring shares
+	 * the OBS clock, so no re-anchoring is needed — the next tick simply samples another angle.
+	 */
+	void set_angle(int angle);
+	int angle() const;
+
 	bool playing() const;
 	double speed() const;
 	Clip clip() const;
@@ -84,6 +92,7 @@ private:
 	uint64_t anchor_wall_ns_ = 0;
 	uint64_t anchor_src_ns_ = 0;
 	uint64_t last_emitted_seq_ = 0;
+	int last_emitted_angle_ = 0;
 	bool has_emitted_ = false;
 	bool playing_ = false;
 };

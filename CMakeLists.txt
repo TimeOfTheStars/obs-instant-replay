@@ -44,18 +44,27 @@ endif()
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
+    src/core/angle-capture.cpp
+    src/core/angle-capture.hpp
+    src/core/angle-manager.cpp
+    src/core/angle-manager.hpp
+    src/core/capture-tap.hpp
     src/core/frame-ring.cpp
     src/core/frame-ring.hpp
+    src/core/main-mix-tap.cpp
+    src/core/main-mix-tap.hpp
+    src/core/memory-calculator.cpp
+    src/core/memory-calculator.hpp
     src/core/playback-engine.cpp
     src/core/playback-engine.hpp
     src/core/plugin-settings.cpp
     src/core/plugin-settings.hpp
-    src/core/program-capture.cpp
-    src/core/program-capture.hpp
     src/core/replay-director.cpp
     src/core/replay-director.hpp
     src/core/replay-source.cpp
     src/core/replay-source.hpp
+    src/core/view-tap.cpp
+    src/core/view-tap.hpp
     src/export/clip-exporter.cpp
     src/export/clip-exporter.hpp
     src/export/export-path.cpp

@@ -22,7 +22,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "core/playback-engine.hpp"
 #include "core/plugin-settings.hpp"
-#include "core/program-capture.hpp"
+#include "core/memory-calculator.hpp"
 #include "core/replay-director.hpp"
 #include "export/clip-exporter.hpp"
 
@@ -92,7 +92,9 @@ ReplayDock::ReplayDock(QWidget *parent) : QWidget(parent)
 
 	layout->addWidget(buildStatusRow());
 	layout->addWidget(buildCaptureRow());
+	layout->addWidget(buildAnglesBox());
 	layout->addWidget(buildSpeedRow());
+	layout->addWidget(buildAngleRow());
 	layout->addWidget(buildTimelineRow());
 	layout->addWidget(buildEventsBox(), 1);
 	layout->addWidget(buildExportBox());
@@ -110,6 +112,7 @@ ReplayDock::ReplayDock(QWidget *parent) : QWidget(parent)
 	connect(delete_shortcut, &QShortcut::activated, this, &ReplayDock::deleteSelectedEvent);
 
 	registerHotkeys();
+	refreshSceneList();
 
 	status_timer = new QTimer(this);
 	connect(status_timer, &QTimer::timeout, this, &ReplayDock::refreshStatus);
@@ -179,18 +182,20 @@ void ReplayDock::registerHotkeys()
 		{nullptr, "onPlay"},
 		{nullptr, "onStop"},
 		{nullptr, "cycleSpeed"},
+		{nullptr, "selectAngleProgram"},
+		{nullptr, "selectAngle1"},
+		{nullptr, "selectAngle2"},
+		{nullptr, "selectAngle3"},
 	};
 	static const char *names[] = {
-		"instant_replay.mark",
-		"instant_replay.play_last",
-		"instant_replay.stop",
-		"instant_replay.speed_cycle",
+		"instant_replay.mark",        "instant_replay.play_last",     "instant_replay.stop",
+		"instant_replay.speed_cycle", "instant_replay.angle_program", "instant_replay.angle_1",
+		"instant_replay.angle_2",     "instant_replay.angle_3",
 	};
 	static const char *descriptions[] = {
-		"Replay.Hotkey.Mark",
-		"Replay.Hotkey.Play",
-		"Replay.Hotkey.Stop",
-		"Replay.Hotkey.SpeedCycle",
+		"Replay.Hotkey.Mark",       "Replay.Hotkey.Play",         "Replay.Hotkey.Stop",
+		"Replay.Hotkey.SpeedCycle", "Replay.Hotkey.AngleProgram", "Replay.Hotkey.Angle1",
+		"Replay.Hotkey.Angle2",     "Replay.Hotkey.Angle3",
 	};
 
 	for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i) {
@@ -322,6 +327,242 @@ QWidget *ReplayDock::buildSpeedRow()
 
 	connect(speed_group, &QButtonGroup::idClicked, this, &ReplayDock::onSpeedChanged);
 	return box;
+}
+
+QWidget *ReplayDock::buildAnglesBox()
+{
+	auto *box = new QGroupBox(obs_module_text("Replay.Angles"), this);
+	auto *layout = new QVBoxLayout(box);
+	layout->setContentsMargins(6, 6, 6, 6);
+	layout->setSpacing(4);
+
+	for (int camera = 0; camera < kCameraCount; ++camera) {
+		auto *row = new QHBoxLayout();
+		auto *check = new QCheckBox(
+			QStringLiteral("%1 %2").arg(obs_module_text("Replay.Angles.Camera")).arg(camera + 1), box);
+		auto *combo = new QComboBox(box);
+		combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+		combo->setMinimumContentsLength(12);
+		row->addWidget(check);
+		row->addWidget(combo, 1);
+		layout->addLayout(row);
+
+		camera_checks[static_cast<size_t>(camera)] = check;
+		camera_combos[static_cast<size_t>(camera)] = combo;
+		connect(check, &QCheckBox::toggled, this, &ReplayDock::onCameraSettingsChanged);
+		connect(combo, &QComboBox::currentIndexChanged, this, &ReplayDock::onCameraSettingsChanged);
+	}
+
+	auto *height_row = new QHBoxLayout();
+	height_row->addWidget(new QLabel(obs_module_text("Replay.Angles.Height"), box));
+	camera_height_combo = new QComboBox(box);
+	camera_height_combo->addItem(QStringLiteral("540p"), 540);
+	camera_height_combo->addItem(QStringLiteral("720p"), 720);
+	camera_height_combo->addItem(QStringLiteral("1080p"), 1080);
+	const int height_index =
+		camera_height_combo->findData(static_cast<int>(PluginSettings::instance().camera_height));
+	camera_height_combo->setCurrentIndex(height_index >= 0 ? height_index : 1);
+	connect(camera_height_combo, &QComboBox::currentIndexChanged, this, &ReplayDock::onCameraSettingsChanged);
+	height_row->addWidget(camera_height_combo, 1);
+	layout->addLayout(height_row);
+
+	/* The one number that decides whether this machine survives the match: total ring memory. */
+	memory_label = new QLabel(box);
+	memory_label->setWordWrap(true);
+	layout->addWidget(memory_label);
+
+	cameras_label = new QLabel(box);
+	cameras_label->setWordWrap(true);
+	cameras_label->setEnabled(false);
+	layout->addWidget(cameras_label);
+	return box;
+}
+
+QWidget *ReplayDock::buildAngleRow()
+{
+	auto *box = new QWidget(this);
+	auto *row = new QHBoxLayout(box);
+	row->setContentsMargins(0, 0, 0, 0);
+	row->addWidget(new QLabel(obs_module_text("Replay.Angle"), box));
+
+	angle_group = new QButtonGroup(this);
+	angle_group->setExclusive(true);
+
+	for (int angle = 0; angle < kAngleCount; ++angle) {
+		const QString text =
+			angle == kProgramAngle
+				? QString(obs_module_text("Replay.Angle.Program"))
+				: QStringLiteral("%1 %2").arg(obs_module_text("Replay.Angles.Camera")).arg(angle);
+		auto *button = new QPushButton(text, box);
+		button->setCheckable(true);
+		button->setChecked(angle == kProgramAngle);
+		angle_group->addButton(button, angle);
+		row->addWidget(button, 1);
+	}
+
+	connect(angle_group, &QButtonGroup::idClicked, this, &ReplayDock::onAngleClicked);
+	return box;
+}
+
+void ReplayDock::refreshSceneList()
+{
+	scene_list_updating = true;
+
+	obs_frontend_source_list scenes = {};
+	obs_frontend_get_scenes(&scenes);
+
+	const PluginSettings &settings = PluginSettings::instance();
+	for (int camera = 0; camera < kCameraCount; ++camera) {
+		QComboBox *combo = camera_combos[static_cast<size_t>(camera)];
+		const CameraBinding &binding = settings.cameras[static_cast<size_t>(camera)];
+
+		combo->clear();
+		combo->addItem(obs_module_text("Replay.Angles.NoScene"), QString());
+
+		int selected = 0;
+		for (size_t index = 0; index < scenes.sources.num; ++index) {
+			obs_source_t *scene = scenes.sources.array[index];
+			const char *name = obs_source_get_name(scene);
+			const char *uuid = obs_source_get_uuid(scene);
+			if (!name || strcmp(name, "Instant Replay") == 0)
+				continue;
+
+			combo->addItem(QString::fromUtf8(name), QString::fromUtf8(uuid ? uuid : ""));
+			/* uuid first, name as the fallback when the collection was re-created. */
+			if ((!binding.uuid.empty() && uuid && binding.uuid == uuid) ||
+			    (selected == 0 && !binding.name.empty() && binding.name == name))
+				selected = combo->count() - 1;
+		}
+		combo->setCurrentIndex(selected);
+		camera_checks[static_cast<size_t>(camera)]->setChecked(binding.enabled);
+	}
+
+	obs_frontend_source_list_free(&scenes);
+	scene_list_updating = false;
+	updateMemoryLabel();
+}
+
+void ReplayDock::onCameraSettingsChanged()
+{
+	if (scene_list_updating)
+		return;
+
+	PluginSettings &settings = PluginSettings::instance();
+	for (int camera = 0; camera < kCameraCount; ++camera) {
+		CameraBinding &binding = settings.cameras[static_cast<size_t>(camera)];
+		const QComboBox *combo = camera_combos[static_cast<size_t>(camera)];
+		binding.uuid = combo->currentData().toString().toStdString();
+		binding.name = combo->currentIndex() > 0 ? combo->currentText().toStdString() : std::string();
+		binding.enabled = camera_checks[static_cast<size_t>(camera)]->isChecked() && !binding.uuid.empty();
+	}
+	settings.camera_height = static_cast<uint32_t>(camera_height_combo->currentData().toInt());
+
+	if (char *collection = obs_frontend_get_current_scene_collection()) {
+		settings.scene_collection = collection;
+		bfree(collection);
+	}
+	save_timer->start();
+
+	/* Cameras never hold clips of their own, so restarting them costs nothing but a refill. */
+	AngleManager::instance().start_cameras_from_settings();
+	updateMemoryLabel();
+}
+
+void ReplayDock::updateMemoryLabel()
+{
+	obs_video_info ovi = {};
+	if (!obs_get_video_info(&ovi) || ovi.fps_den == 0) {
+		memory_label->setText(QStringLiteral("—"));
+		return;
+	}
+
+	const PluginSettings &settings = PluginSettings::instance();
+	const double fps = static_cast<double>(ovi.fps_num) / ovi.fps_den;
+	const double seconds = buffer_spin ? buffer_spin->value() : settings.buffer_seconds;
+	const uint32_t divisor = std::max<uint32_t>(1, settings.frame_rate_divisor);
+
+	uint64_t required = ring_bytes(ovi.output_width, ovi.output_height, ovi.output_format, fps, divisor, seconds);
+
+	const uint32_t height = static_cast<uint32_t>(camera_height_combo->currentData().toInt());
+	const uint32_t camera_height = std::min(height, ovi.base_height);
+	const uint32_t camera_width = camera_width_for_height(ovi.base_width, ovi.base_height, camera_height);
+	for (int camera = 0; camera < kCameraCount; ++camera) {
+		if (camera_checks[static_cast<size_t>(camera)]->isChecked() &&
+		    camera_combos[static_cast<size_t>(camera)]->currentIndex() > 0)
+			required += ring_bytes(camera_width, camera_height, ovi.output_format, fps, divisor, seconds);
+	}
+
+	const uint64_t budget = AngleManager::memory_budget();
+	const double gib = 1024.0 * 1024.0 * 1024.0;
+	memory_label->setText(QStringLiteral("%1 %2 GB   ·   %3 %4 GB")
+				      .arg(obs_module_text("Replay.Angles.Memory.Required"))
+				      .arg(static_cast<double>(required) / gib, 0, 'f', 2)
+				      .arg(obs_module_text("Replay.Angles.Memory.Budget"))
+				      .arg(static_cast<double>(budget) / gib, 0, 'f', 2));
+
+	/* Palette colours everywhere else; red is the one exception an operator must not miss. */
+	memory_label->setStyleSheet(required > budget ? QStringLiteral("color: #e04040; font-weight: bold;")
+						      : QString());
+}
+
+void ReplayDock::onAngleClicked(int angle)
+{
+	PlaybackEngine::instance().set_angle(angle);
+}
+
+void ReplayDock::selectAngle(int angle)
+{
+	if (QAbstractButton *button = angle_group->button(angle)) {
+		if (!button->isEnabled())
+			return;
+		button->setChecked(true);
+	}
+	onAngleClicked(angle);
+}
+
+void ReplayDock::selectAngleProgram()
+{
+	selectAngle(kProgramAngle);
+}
+
+void ReplayDock::selectAngle1()
+{
+	selectAngle(1);
+}
+
+void ReplayDock::selectAngle2()
+{
+	selectAngle(2);
+}
+
+void ReplayDock::selectAngle3()
+{
+	selectAngle(3);
+}
+
+void ReplayDock::updateAngleButtons()
+{
+	AngleManager &angles = AngleManager::instance();
+	const int selected = selectedEvent();
+	const Clip *clip = (selected >= 0 && selected < static_cast<int>(events.size()))
+				   ? &events[static_cast<size_t>(selected)].clip
+				   : nullptr;
+
+	for (int angle = 1; angle < kAngleCount; ++angle) {
+		QAbstractButton *button = angle_group->button(angle);
+		if (!button)
+			continue;
+
+		const AngleCapture &capture = angles.angle(angle);
+		bool available = capture.running();
+		/* A camera that was not buffering during the clip has nothing to show for it. */
+		if (available && clip && clip->valid())
+			available = capture.covers(clip->ts_in) && capture.covers(clip->ts_out);
+		button->setEnabled(available);
+	}
+
+	if (QAbstractButton *active = angle_group->button(angles.active_angle()))
+		active->setChecked(true);
 }
 
 QWidget *ReplayDock::buildTimelineRow()
@@ -723,20 +964,19 @@ void ReplayDock::applyBufferSetting()
 	settings.clip_length_sec = length_spin->value();
 	save_timer->start();
 
-	if (!ProgramCapture::instance().running())
+	updateMemoryLabel();
+
+	if (!AngleManager::instance().program_running())
 		return;
 
-	/* Reallocating the ring throws away everything buffered so far, including marked clips. */
+	/* Reallocating the rings throws away everything buffered so far, including marked clips. */
 	ReplayDirector::instance().reset();
 	events.clear();
 	rebuildEventList();
 	showSelection(-1);
 
-	CaptureSettings capture = ProgramCapture::instance().settings();
-	capture.duration_sec = settings.buffer_seconds;
-	ProgramCapture::instance().stop();
-	if (!ProgramCapture::instance().start(capture))
-		obs_log(LOG_WARNING, "could not restart the buffer with %.1f s", settings.buffer_seconds);
+	AngleManager::instance().stop_all();
+	AngleManager::instance().start_from_settings();
 }
 
 void ReplayDock::onSpeedChanged(int percent)
@@ -756,10 +996,37 @@ void ReplayDock::refreshStatus()
 			updateEventItem(static_cast<int>(index));
 	}
 
-	ProgramCapture::instance().poll_video_settings();
+	AngleManager &angles = AngleManager::instance();
+	angles.poll();
 	ReplayDirector::instance().poll();
+	updateAngleButtons();
 
-	const CaptureStatus status = ProgramCapture::instance().status();
+	QString cameras;
+	for (int camera = 0; camera < kCameraCount; ++camera) {
+		const CameraState state = angles.camera_state(camera);
+		if (!state.enabled)
+			continue;
+		if (!cameras.isEmpty())
+			cameras += QStringLiteral("   ·   ");
+		cameras += QStringLiteral("%1 %2: ").arg(obs_module_text("Replay.Angles.Camera")).arg(camera + 1);
+		if (state.running) {
+			const CaptureStatus camera_status = angles.angle(camera + 1).status();
+			cameras += QStringLiteral("%1×%2 %3 %4 s")
+					   .arg(camera_status.width)
+					   .arg(camera_status.height)
+					   .arg(camera_status.paused ? obs_module_text("Replay.Status.Paused")
+								     : obs_module_text("Replay.Status.Recording"))
+					   .arg(std::min(camera_status.buffered_sec, camera_status.capacity_sec), 0,
+						'f', 1);
+			if (camera_status.slow_frames > 0)
+				cameras += QStringLiteral(" ⚠%1").arg(camera_status.slow_frames);
+		} else {
+			cameras += QString::fromStdString(state.error.empty() ? std::string("—") : state.error);
+		}
+	}
+	cameras_label->setText(cameras);
+
+	const CaptureStatus status = angles.program().status();
 
 	if (!status.running) {
 		buffer_bar->setValue(0);

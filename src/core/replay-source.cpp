@@ -19,7 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "replay-source.hpp"
 
 #include "playback-engine.hpp"
-#include "program-capture.hpp"
+#include "angle-manager.hpp"
 
 #include <obs-module.h>
 #include <media-io/video-io.h>
@@ -91,13 +91,13 @@ void replay_source_video_tick(void *data, float)
 	auto *context = static_cast<ReplaySource *>(data);
 
 	/* Keeps the ring alive for as long as we hold pointers into it. */
-	const auto ring_guard = ProgramCapture::instance().reader_guard();
+	const auto ring_guard = AngleManager::instance().reader_guard();
 
 	const FramePick pick = PlaybackEngine::instance().next_frame();
 	if (!pick.has_frame)
 		return;
 
-	const video_format format = ProgramCapture::instance().ring().config().format;
+	const video_format format = pick.format;
 	if (!update_colour_parameters(context, format))
 		return;
 

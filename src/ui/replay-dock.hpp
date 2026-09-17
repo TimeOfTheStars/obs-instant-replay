@@ -18,12 +18,14 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #pragma once
 
+#include "core/angle-manager.hpp"
 #include "core/playback-engine.hpp"
 
 #include <obs.h>
 
 #include <QWidget>
 
+#include <array>
 #include <utility>
 #include <vector>
 
@@ -56,6 +58,13 @@ public slots:
 	void onPlay();
 	void onStop();
 	void cycleSpeed();
+	void selectAngleProgram();
+	void selectAngle1();
+	void selectAngle2();
+	void selectAngle3();
+
+	/* Scenes changed (added, renamed, collection switched): refill the camera pickers. */
+	void refreshSceneList();
 
 private slots:
 	void onSpeedChanged(int speed_percent);
@@ -65,6 +74,8 @@ private slots:
 	void onEventsContextMenu(const QPoint &position);
 	void onSettingsChanged();
 	void applyBufferSetting();
+	void onCameraSettingsChanged();
+	void onAngleClicked(int angle);
 	void renameSelectedEvent();
 	void deleteSelectedEvent();
 	void refreshStatus();
@@ -73,6 +84,8 @@ private:
 	QWidget *buildStatusRow();
 	QWidget *buildCaptureRow();
 	QWidget *buildSpeedRow();
+	QWidget *buildAnglesBox();
+	QWidget *buildAngleRow();
 	QWidget *buildTimelineRow();
 	QWidget *buildEventsBox();
 	QWidget *buildTransportRow();
@@ -102,6 +115,15 @@ private:
 	ReplayTimeline *timeline = nullptr;
 	QLabel *timeline_label = nullptr;
 
+	/* angles */
+	std::array<QCheckBox *, kCameraCount> camera_checks = {};
+	std::array<QComboBox *, kCameraCount> camera_combos = {};
+	QComboBox *camera_height_combo = nullptr;
+	QLabel *memory_label = nullptr;
+	QLabel *cameras_label = nullptr;
+	QButtonGroup *angle_group = nullptr;
+	bool scene_list_updating = false;
+
 	QTimer *status_timer = nullptr;
 	QTimer *save_timer = nullptr;
 
@@ -118,6 +140,9 @@ private:
 	bool play(int event_index);
 	int selectedEvent() const;
 	void clampClipLength();
+	void updateAngleButtons();
+	void updateMemoryLabel();
+	void selectAngle(int angle);
 	void rebuildEventList();
 	void updateEventItem(int event_index);
 	void showSelection(int event_index);

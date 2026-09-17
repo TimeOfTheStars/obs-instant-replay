@@ -18,7 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "replay-director.hpp"
 
-#include "program-capture.hpp"
+#include "angle-manager.hpp"
 #include "replay-source.hpp"
 
 #include <obs-frontend-api.h>
@@ -144,10 +144,10 @@ bool ReplayDirector::play_to_program(const Clip &clip, double speed, bool auto_r
 	 * Stop recording before the transition starts: the ring captures the program mix, so a replay
 	 * on program would otherwise be recorded back into the buffer.
 	 */
-	ProgramCapture::instance().set_paused(true);
+	AngleManager::instance().set_paused_all(true);
 
 	if (!PlaybackEngine::instance().play(clip, speed)) {
-		ProgramCapture::instance().set_paused(false);
+		AngleManager::instance().set_paused_all(false);
 		obs_source_release(replay_scene);
 		return false;
 	}
@@ -176,6 +176,7 @@ void ReplayDirector::finish(bool return_to_live)
 		return;
 
 	active_ = false;
+	AngleManager::instance().set_active_angle(kProgramAngle);
 
 	if (return_to_live && return_scene_) {
 		obs_source_t *live = obs_weak_source_get_source(return_scene_);
@@ -195,7 +196,7 @@ void ReplayDirector::poll()
 {
 	if (resume_capture_at_ns_ && os_gettime_ns() >= resume_capture_at_ns_) {
 		resume_capture_at_ns_ = 0;
-		ProgramCapture::instance().set_paused(false);
+		AngleManager::instance().set_paused_all(false);
 	}
 
 	if (!active_)
