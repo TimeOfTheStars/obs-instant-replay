@@ -122,7 +122,8 @@ private:
 	QLabel *memory_label = nullptr;
 	QLabel *cameras_label = nullptr;
 	QButtonGroup *angle_group = nullptr;
-	bool scene_list_updating = false;
+	/* Starts true: combo boxes fire change signals while they are being built and filled. */
+	bool scene_list_updating = true;
 
 	QTimer *status_timer = nullptr;
 	QTimer *save_timer = nullptr;
