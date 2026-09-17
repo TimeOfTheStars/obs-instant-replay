@@ -22,6 +22,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <cmath>
 
 #ifdef _WIN32
+/* windows.h defines min/max as macros, which breaks std::max below. */
+#define NOMINMAX
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>

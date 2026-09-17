@@ -39,6 +39,8 @@ extern "C" {
 #include <cstring>
 
 #ifdef _WIN32
+/* windows.h defines min/max as macros, which breaks std::max below. */
+#define NOMINMAX
 #include <windows.h>
 #endif
 
