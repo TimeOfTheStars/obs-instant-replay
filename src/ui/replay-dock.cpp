@@ -549,21 +549,51 @@ void ReplayDock::updateAngleButtons()
 				   ? &events[static_cast<size_t>(selected)].clip
 				   : nullptr;
 
+	if (QAbstractButton *program = angle_group->button(kProgramAngle))
+		program->setToolTip(obs_module_text("Replay.Angle.Tip.Program"));
+
 	for (int angle = 1; angle < kAngleCount; ++angle) {
 		QAbstractButton *button = angle_group->button(angle);
 		if (!button)
 			continue;
 
+		const CameraState state = angles.camera_state(angle - 1);
 		const AngleCapture &capture = angles.angle(angle);
+
 		bool available = capture.running();
-		/* A camera that was not buffering during the clip has nothing to show for it. */
-		if (available && clip && clip->valid())
-			available = capture.covers(clip->ts_in) && capture.covers(clip->ts_out);
+		QString tip;
+
+		if (!state.enabled) {
+			tip = obs_module_text("Replay.Angle.Tip.NotConfigured");
+		} else if (!available) {
+			tip = QStringLiteral("%1 %2")
+				      .arg(obs_module_text("Replay.Angle.Tip.NotRunning"))
+				      .arg(QString::fromStdString(state.error));
+		} else if (clip && clip->valid() && !(capture.covers(clip->ts_in) && capture.covers(clip->ts_out))) {
+			/* A camera that was not buffering during the clip has nothing to show for it. */
+			available = false;
+			tip = obs_module_text("Replay.Angle.Tip.NoFootage");
+		} else {
+			tip = obs_module_text("Replay.Angle.Tip.Available");
+		}
+
 		button->setEnabled(available);
+		button->setToolTip(tip);
 	}
 
-	if (QAbstractButton *active = angle_group->button(angles.active_angle()))
-		active->setChecked(true);
+	/*
+	 * Playback silently falls back to the programme when the chosen camera cannot serve the
+	 * moment; keep the buttons telling the same story instead of leaving a dead angle selected.
+	 */
+	const int active = angles.active_angle();
+	if (active != kProgramAngle) {
+		const QAbstractButton *button = angle_group->button(active);
+		if (!button || !button->isEnabled())
+			angles.set_active_angle(kProgramAngle);
+	}
+
+	if (QAbstractButton *current = angle_group->button(angles.active_angle()))
+		current->setChecked(true);
 }
 
 QWidget *ReplayDock::buildTimelineRow()
@@ -1027,6 +1057,8 @@ void ReplayDock::refreshStatus()
 			cameras += QString::fromStdString(state.error.empty() ? std::string("—") : state.error);
 		}
 	}
+	if (cameras.isEmpty())
+		cameras = obs_module_text("Replay.Angles.NoneHint");
 	cameras_label->setText(cameras);
 
 	const CaptureStatus status = angles.program().status();

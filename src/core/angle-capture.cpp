@@ -221,7 +221,13 @@ bool AngleCapture::covers(uint64_t timestamp) const
 	if (head == 0)
 		return false;
 
-	const uint64_t first = std::max(ring_.oldest(), ring_.gap_seq());
+	/*
+	 * Deliberately not clamped to the gap marker. That marker exists so MARK never stitches a new
+	 * clip across a recording pause; frames recorded *before* the pause are still in the ring and
+	 * are perfectly good to play back. Clamping here made every camera unavailable for clips
+	 * marked before the first replay, because finishing a replay moves the marker past them.
+	 */
+	const uint64_t first = ring_.oldest();
 	uint64_t first_ts = 0;
 	uint64_t last_ts = 0;
 	if (!ring_.timestamp_at(first, first_ts) || !ring_.timestamp_at(head - 1, last_ts))

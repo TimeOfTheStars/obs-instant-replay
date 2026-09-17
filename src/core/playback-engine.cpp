@@ -269,9 +269,9 @@ FramePick PlaybackEngine::next_frame()
 	if (angle == kProgramAngle) {
 		found = ring.find_by_timestamp(wanted_ts, clip_.seq_in, clip_.seq_out, seq);
 	} else {
+		/* Whole ring, gap marker included: see AngleCapture::covers(). */
 		const uint64_t head = ring.head();
-		found = head > 0 &&
-			ring.find_by_timestamp(wanted_ts, std::max(ring.oldest(), ring.gap_seq()), head - 1, seq);
+		found = head > 0 && ring.find_by_timestamp(wanted_ts, ring.oldest(), head - 1, seq);
 	}
 
 	if (!found) {
