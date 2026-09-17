@@ -25,6 +25,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "core/memory-calculator.hpp"
 #include "core/replay-director.hpp"
 #include "export/clip-exporter.hpp"
+#include "export/export-path.hpp"
 
 #include <obs-frontend-api.h>
 #include <obs-module.h>
@@ -760,11 +761,22 @@ void ReplayDock::onMark()
 	event.clip = clip;
 	event.name = QStringLiteral("%1 %2").arg(obs_module_text("Replay.Event")).arg(events.size() + 1);
 	if (PluginSettings::instance().export_enabled) {
-		ExportOptions options;
-		options.encoder = PluginSettings::instance().export_encoder;
-		options.crf = PluginSettings::instance().export_crf;
-		options.base_dir = PluginSettings::instance().export_dir;
-		event.export_job = ClipExporter::instance().enqueue(clip, event.name.toStdString(), options);
+		const PluginSettings &settings = PluginSettings::instance();
+		const std::string base = export_base_directory(settings.export_dir);
+
+		std::string stem;
+		std::string path_error;
+		if (build_export_stem(base, event.name.toStdString(), ClipExporter::instance().reserve_sequence(), stem,
+				      path_error)) {
+			ExportOptions options;
+			options.encoder = settings.export_encoder;
+			options.crf = settings.export_crf;
+			event.export_job = ClipExporter::instance().enqueue(
+				kProgramAngle, clip, export_angle_file(stem, kProgramAngle), options);
+		} else {
+			obs_log(LOG_WARNING, "export: %s", path_error.c_str());
+			format_label->setText(QString::fromStdString(path_error));
+		}
 	}
 
 	events.push_back(event);

@@ -47,9 +47,6 @@ extern "C" {
 
 namespace {
 
-/* Frames still missing after this many attempts at the clip start mean the head is gone for good. */
-constexpr double kMaxLeadingLossSec = 1.0;
-
 /*
  * FFmpeg explains failures only through av_log, and OBS already routes that callback into its own
  * log (obs-ffmpeg), so the detailed reason for an encoder failure is in the OBS log as "[ffmpeg]"
@@ -220,20 +217,27 @@ ClipExporter::~ClipExporter()
 	shutdown();
 }
 
-int ClipExporter::enqueue(const Clip &clip, const std::string &event_name, const ExportOptions &options)
+int ClipExporter::reserve_sequence()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return ++sequence_;
+}
+
+int ClipExporter::enqueue(int angle, const Clip &clip, const std::string &path, const ExportOptions &options)
 {
 	Job job;
+	job.angle = angle;
 	job.clip = clip;
-	job.event_name = event_name;
+	job.path = path;
 	job.encoder = resolve_encoder(options.encoder);
 	job.crf = std::clamp(options.crf, 10, 30);
-	job.base_dir = export_base_directory(options.base_dir);
 
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		job.id = next_id_++;
 		ExportStatus status;
-		status.frames_total = clip.seq_out - clip.seq_in;
+		status.path = path;
+		status.media.angle = angle;
 		statuses_[job.id] = status;
 		queue_.push_back(job);
 	}
@@ -286,6 +290,12 @@ void ClipExporter::update(int job_id, ExportState state, uint64_t done, uint64_t
 		status.error = error;
 }
 
+void ClipExporter::set_media(int job_id, const ExportMedia &media)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	statuses_[job_id].media = media;
+}
+
 void ClipExporter::worker_loop()
 {
 	os_set_thread_name("instant-replay-export");
@@ -307,43 +317,37 @@ void ClipExporter::worker_loop()
 
 void ClipExporter::run(const Job &job)
 {
-	const uint64_t total = job.clip.seq_out - job.clip.seq_in;
-	update(job.id, ExportState::Encoding, 0, total, "", "");
-
 	AngleManager &angles = AngleManager::instance();
-	const AngleCapture &capture = angles.program();
+	const AngleCapture &capture = angles.angle(job.angle);
+	const std::string &path = job.path;
+
 	if (!capture.running()) {
-		update(job.id, ExportState::Failed, 0, total, "", "buffer is not running");
+		update(job.id, ExportState::Failed, 0, 0, path, "buffer is not running");
 		return;
 	}
 
 	const FrameRing &ring = capture.ring();
 	const RingConfig config = ring.config();
+
+	/* Frames are addressed by time, so the expected count follows from the clip, not from seq. */
+	const uint64_t total = static_cast<uint64_t>(job.clip.duration_sec() * config.fps);
+
 	const AVPixelFormat pixel_format = pixel_format_for(config.format);
 	if (pixel_format == AV_PIX_FMT_NONE) {
-		update(job.id, ExportState::Failed, 0, total, "", "buffer colour format cannot be exported");
+		update(job.id, ExportState::Failed, 0, total, path, "buffer colour format cannot be exported");
 		return;
 	}
+
+	update(job.id, ExportState::Encoding, 0, total, path, "");
 
 	obs_video_info ovi = {};
 	obs_get_video_info(&ovi);
 	/* The ring's own rate already accounts for any frame decimation. */
 	const AVRational time_base = av_d2q(1.0 / std::max(config.fps, 1.0), 100000);
 
-	std::string path;
 	std::string error;
-	int sequence = 0;
-	{
-		std::lock_guard<std::mutex> lock(mutex_);
-		sequence = ++sequence_;
-	}
-	if (!build_export_path(job.base_dir, job.event_name, sequence, path, error)) {
-		update(job.id, ExportState::Failed, 0, total, "", error);
-		return;
-	}
-
 	const uint64_t started = os_gettime_ns();
-	obs_log(LOG_INFO, "export #%d: %s, %llu frames, encoder %s", job.id, path.c_str(),
+	obs_log(LOG_INFO, "export #%d: angle %d -> %s, ~%llu frames, encoder %s", job.id, job.angle, path.c_str(),
 		static_cast<unsigned long long>(total), job.encoder.c_str());
 
 	EncodeSession session;
@@ -387,7 +391,8 @@ void ClipExporter::run(const Job &job)
 		session.codec->pix_fmt = pixel_format;
 		session.codec->time_base = time_base;
 		session.codec->framerate = {time_base.den, time_base.num};
-		session.codec->gop_size = static_cast<int>(2.0 * config.fps);
+		/* One keyframe per second: halves the worst-case seek when the clip is played back. */
+		session.codec->gop_size = static_cast<int>(config.fps);
 		session.codec->max_b_frames = 2;
 		apply_colour(session.codec, ovi);
 		if (session.format->oformat->flags & AVFMT_GLOBALHEADER)
@@ -491,50 +496,117 @@ void ClipExporter::run(const Job &job)
 
 	uint64_t written_frames = 0;
 	uint64_t lost_frames = 0;
+	uint64_t ts_origin = 0;
+	uint64_t ts_last = 0;
+	int64_t last_pts = -1;
 	bool truncated = false;
-	const uint64_t max_leading_loss = static_cast<uint64_t>(kMaxLeadingLossSec * config.fps);
 
-	for (uint64_t seq = job.clip.seq_in; seq < job.clip.seq_out; ++seq) {
+	/* Frames are found by timestamp: clip sequence numbers only mean something in the programme ring. */
+	uint64_t seq = 0;
+	{
+		const auto guard = angles.reader_guard();
+		const uint64_t head = ring.head();
+		if (head == 0 || !ring.find_by_timestamp(job.clip.ts_in, ring.oldest(), head - 1, seq)) {
+			update(job.id, ExportState::Failed, 0, total, path, "clip is no longer in the buffer");
+			return;
+		}
+	}
+
+	/* Guards against spinning if the writer keeps outrunning us while nothing has been written yet. */
+	int skips = 0;
+	constexpr int kMaxSkips = 400;
+
+	for (;;) {
 		if (stop_.load(std::memory_order_acquire)) {
 			truncated = true;
 			break;
 		}
 
 		bool valid = false;
+		bool at_end = false;
+		bool lost = false;
+		uint64_t frame_ts = 0;
+		uint64_t oldest = 0;
+
 		{
 			/* Per frame, not per clip: a profile switch must not wait seconds for us. */
 			const auto guard = angles.reader_guard();
-			FrameMeta meta;
-			const uint8_t *planes[MAX_AV_PLANES] = {};
-			if (capture.running() && ring.read(seq, meta, planes) &&
-			    av_frame_make_writable(session.frame) >= 0) {
-				for (size_t plane = 0; plane < plane_count; ++plane) {
-					const size_t stride =
-						std::min<size_t>(meta.linesize[plane],
-								 static_cast<size_t>(session.frame->linesize[plane]));
-					for (size_t row = 0; row < plane_rows[plane]; ++row)
-						memcpy(session.frame->data[plane] +
-							       row * session.frame->linesize[plane],
-						       planes[plane] + row * meta.linesize[plane], stride);
+			if (!capture.running()) {
+				truncated = true;
+				break;
+			}
+
+			oldest = ring.oldest();
+			const uint64_t head = ring.head();
+
+			if (seq >= head) {
+				at_end = true; /* caught up with the live edge */
+			} else if (seq < oldest) {
+				lost = true; /* the writer got here first */
+			} else {
+				FrameMeta meta;
+				const uint8_t *planes[MAX_AV_PLANES] = {};
+				if (!ring.read(seq, meta, planes)) {
+					lost = true;
+				} else if (meta.timestamp > job.clip.ts_out) {
+					at_end = true;
+				} else if (meta.width != config.width || meta.height != config.height) {
+					/* The ring was rebuilt under us; the plane layout we cached no longer fits. */
+					lost = true;
+				} else if (av_frame_make_writable(session.frame) >= 0) {
+					for (size_t plane = 0; plane < plane_count; ++plane) {
+						const size_t stride = std::min<size_t>(
+							meta.linesize[plane],
+							static_cast<size_t>(session.frame->linesize[plane]));
+						for (size_t row = 0; row < plane_rows[plane]; ++row)
+							memcpy(session.frame->data[plane] +
+								       row * session.frame->linesize[plane],
+							       planes[plane] + row * meta.linesize[plane], stride);
+					}
+					/*
+					 * The writer may have caught up while we were copying; trust the frame
+					 * only if it is still in place and inside the clip.
+					 */
+					valid = seq >= ring.oldest() && meta.timestamp >= job.clip.ts_in;
+					frame_ts = meta.timestamp;
 				}
-				/*
-				 * The writer may have caught up while we were copying; the ring may even have been
-				 * rebuilt (head reset). Trust the frame only if it is still in place and in range.
-				 */
-				valid = seq >= ring.oldest() && meta.timestamp >= job.clip.ts_in &&
-					meta.timestamp <= job.clip.ts_out;
 			}
 		}
 
-		if (!valid) {
+		if (at_end)
+			break;
+
+		if (lost || !valid) {
 			++lost_frames;
-			if (written_frames == 0 && lost_frames <= max_leading_loss)
-				continue; /* the head was overwritten before we started; begin later */
 			truncated = true;
+
+			if (written_frames == 0 && ++skips < kMaxSkips) {
+				/*
+				 * Nothing written yet: jump straight to the oldest frame still alive instead of
+				 * stepping one sequence at a time, which used to burn the whole budget in
+				 * microseconds and fail the export outright.
+				 */
+				seq = std::max(seq + 1, oldest);
+				continue;
+			}
 			break;
 		}
 
-		session.frame->pts = static_cast<int64_t>(written_frames);
+		if (written_frames == 0)
+			ts_origin = frame_ts;
+
+		/*
+		 * pts follows the frame's own timestamp, not a counter: frames in the ring are not evenly
+		 * spaced, and counting them would turn every dropped frame into a permanent time shift.
+		 */
+		int64_t pts =
+			av_rescale_q(static_cast<int64_t>(frame_ts - ts_origin), AVRational{1, 1000000000}, time_base);
+		if (written_frames > 0 && pts <= last_pts)
+			pts = last_pts + 1;
+		session.frame->pts = pts;
+		last_pts = pts;
+		ts_last = frame_ts;
+
 		result = avcodec_send_frame(session.codec, session.frame);
 		if (result < 0) {
 			error = "encoder rejected frame: " + ffmpeg_error(result);
@@ -544,6 +616,7 @@ void ClipExporter::run(const Job &job)
 			break;
 
 		++written_frames;
+		++seq;
 		if ((written_frames & 15) == 0)
 			update(job.id, ExportState::Encoding, written_frames, total, path, "");
 	}
@@ -554,6 +627,8 @@ void ClipExporter::run(const Job &job)
 	}
 
 	const double seconds = static_cast<double>(os_gettime_ns() - started) / 1e9;
+	/* Encoding speed decides whether several angles can be exported at once; log it to tune that. */
+	const double encoded_fps = seconds > 0.0 ? static_cast<double>(written_frames) / seconds : 0.0;
 
 	if (!error.empty()) {
 		obs_log(LOG_WARNING, "export #%d failed: %s", job.id, error.c_str());
@@ -568,17 +643,27 @@ void ClipExporter::run(const Job &job)
 		return;
 	}
 
+	ExportMedia media;
+	media.angle = job.angle;
+	media.ts_origin = ts_origin;
+	media.ts_last = ts_last;
+	media.frames = written_frames;
+	media.fps = config.fps;
+	media.width = config.width;
+	media.height = config.height;
+	set_media(job.id, media);
+
 	if (truncated || lost_frames > 0) {
 		obs_log(LOG_WARNING,
 			"export #%d: clip truncated to %llu of %llu frames (ring overwritten) — lengthen the buffer or "
-			"shorten the clip; %.1f s",
+			"shorten the clip; %.1f s = %.0f fps",
 			job.id, static_cast<unsigned long long>(written_frames), static_cast<unsigned long long>(total),
-			seconds);
+			seconds, encoded_fps);
 		update(job.id, ExportState::DoneTruncated, written_frames, total, path, "");
 		return;
 	}
 
-	obs_log(LOG_INFO, "export #%d: done, %llu frames in %.1f s", job.id,
-		static_cast<unsigned long long>(written_frames), seconds);
+	obs_log(LOG_INFO, "export #%d: done, %llu frames in %.1f s = %.0f fps", job.id,
+		static_cast<unsigned long long>(written_frames), seconds, encoded_fps);
 	update(job.id, ExportState::Done, written_frames, total, path, "");
 }

@@ -27,8 +27,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 std::string export_base_directory(const std::string &configured);
 
 /*
- * Creates <base>/<YYYY-MM-DD>/ and returns a free file name inside it shaped like
- * HH-MM-SS_<event>-NN.mp4. Returns false with `error` set if the folder cannot be created.
+ * Creates <base>/<YYYY-MM-DD>/ and returns the shared name prefix for one event, shaped like
+ * <folder>/HH-MM-SS_<event>-NN. Every angle of the event appends its own suffix to this, so the
+ * files sort next to each other. Returns false with `error` set if the folder cannot be created.
  */
-bool build_export_path(const std::string &base, const std::string &event_name, int sequence, std::string &path,
+bool build_export_stem(const std::string &base, const std::string &event_name, int sequence, std::string &stem,
 		       std::string &error);
+
+/* <stem>_program.mp4 / <stem>_camN.mp4 */
+std::string export_angle_file(const std::string &stem, int angle);

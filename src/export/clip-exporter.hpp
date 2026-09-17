@@ -31,12 +31,28 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 enum class ExportState { Queued, Encoding, Done, DoneTruncated, Failed };
 
+/*
+ * What a finished file contains, in terms a player can position with. pts = 0 is the first frame
+ * that actually made it into the file, which is not necessarily the clip's in point: the head of
+ * the clip may have been overwritten before the encoder opened.
+ */
+struct ExportMedia {
+	int angle = 0;
+	uint64_t ts_origin = 0; /* OBS timestamp of the frame written as pts = 0 */
+	uint64_t ts_last = 0;   /* OBS timestamp of the last written frame */
+	uint64_t frames = 0;
+	double fps = 0.0;
+	uint32_t width = 0;
+	uint32_t height = 0;
+};
+
 struct ExportStatus {
 	ExportState state = ExportState::Queued;
 	uint64_t frames_done = 0;
 	uint64_t frames_total = 0;
 	std::string path;
 	std::string error;
+	ExportMedia media;
 };
 
 struct ExportOptions {
@@ -56,8 +72,14 @@ class ClipExporter {
 public:
 	static ClipExporter &instance();
 
+	/*
+	 * Reserves the per-event number used in file names. Called once per MARK from the Qt thread,
+	 * so every angle of one event shares a stem instead of drifting apart by seconds and numbers.
+	 */
+	int reserve_sequence();
+
 	/* Qt thread. Returns a job id for status polling. */
-	int enqueue(const Clip &clip, const std::string &event_name, const ExportOptions &options);
+	int enqueue(int angle, const Clip &clip, const std::string &path, const ExportOptions &options);
 
 	ExportStatus status(int job_id) const;
 
@@ -70,11 +92,12 @@ private:
 
 	struct Job {
 		int id = 0;
+		/* Index, never a pointer: AngleManager rebuilds AngleCapture objects on settings changes. */
+		int angle = 0;
 		Clip clip;
-		std::string event_name;
-		std::string encoder; /* resolved: libx264 | h264_nvenc */
+		std::string path;
+		std::string encoder; /* resolved: libx264 | h264_nvenc | … */
 		int crf = 18;
-		std::string base_dir;
 	};
 
 	void ensure_worker();
@@ -82,6 +105,7 @@ private:
 	void run(const Job &job);
 	void update(int job_id, ExportState state, uint64_t done, uint64_t total, const std::string &path,
 		    const std::string &error);
+	void set_media(int job_id, const ExportMedia &media);
 
 	mutable std::mutex mutex_;
 	std::condition_variable wake_;

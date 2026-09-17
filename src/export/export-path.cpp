@@ -95,7 +95,7 @@ std::string export_base_directory(const std::string &configured)
 	return ".";
 }
 
-bool build_export_path(const std::string &base, const std::string &event_name, int sequence, std::string &path,
+bool build_export_stem(const std::string &base, const std::string &event_name, int sequence, std::string &stem,
 		       std::string &error)
 {
 	std::tm now = {};
@@ -113,14 +113,26 @@ bool build_export_path(const std::string &base, const std::string &event_name, i
 		return false;
 	}
 
-	const std::string stem = directory + "/" + clock + "_" + sanitize_component(event_name);
 	char suffix[16];
 	std::snprintf(suffix, sizeof(suffix), "-%02d", sequence);
+	const std::string base_stem =
+		directory + "/" + std::string(clock) + "_" + sanitize_component(event_name) + suffix;
 
-	std::string candidate = stem + suffix + ".mp4";
-	for (int attempt = 2; os_file_exists(candidate.c_str()) && attempt < 100; ++attempt)
-		candidate = stem + suffix + "-" + std::to_string(attempt) + ".mp4";
+	/*
+	 * Uniqueness is decided once, on the whole event: checking each angle separately would let
+	 * one angle take a "-2" suffix and split the event's files apart.
+	 */
+	std::string candidate = base_stem;
+	for (int attempt = 2; os_file_exists(export_angle_file(candidate, 0).c_str()) && attempt < 100; ++attempt)
+		candidate = base_stem + "-" + std::to_string(attempt);
 
-	path = candidate;
+	stem = candidate;
 	return true;
+}
+
+std::string export_angle_file(const std::string &stem, int angle)
+{
+	if (angle <= 0)
+		return stem + "_program.mp4";
+	return stem + "_cam" + std::to_string(angle) + ".mp4";
 }
