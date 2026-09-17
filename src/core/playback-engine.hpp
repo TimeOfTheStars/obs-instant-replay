@@ -21,6 +21,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "frame-ring.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -44,7 +45,15 @@ struct FramePick {
 	bool finished = false; /* playback reached the out point */
 	FrameMeta meta;
 	video_format format = VIDEO_FORMAT_NONE;
+	video_colorspace colorspace = VIDEO_CS_DEFAULT;
+	video_range_type range = VIDEO_RANGE_DEFAULT;
 	const uint8_t *planes[MAX_AV_PLANES] = {};
+
+	/*
+	 * Set when the pixels came from a saved file: owns the decoded picture until the tick ends.
+	 * Ring frames leave it empty — those are covered by the source's reader_guard().
+	 */
+	std::shared_ptr<void> keepalive;
 };
 
 /*
@@ -93,6 +102,9 @@ private:
 	uint64_t anchor_src_ns_ = 0;
 	uint64_t last_emitted_seq_ = 0;
 	int last_emitted_angle_ = 0;
+	bool last_emitted_from_file_ = false;
+	video_colorspace ring_colorspace_ = VIDEO_CS_DEFAULT;
+	video_range_type ring_range_ = VIDEO_RANGE_DEFAULT;
 	bool has_emitted_ = false;
 	bool playing_ = false;
 };

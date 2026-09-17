@@ -69,6 +69,10 @@ target_sources(
     src/export/clip-exporter.hpp
     src/export/export-path.cpp
     src/export/export-path.hpp
+    src/playback/clip-file-player.cpp
+    src/playback/clip-file-player.hpp
+    src/playback/clip-file-source.cpp
+    src/playback/clip-file-source.hpp
     src/plugin-main.cpp
     src/ui/replay-dock.cpp
     src/ui/replay-dock.hpp

@@ -147,6 +147,7 @@ private:
 	int selectedEvent() const;
 	void clampClipLength();
 	void updateAngleButtons();
+	void prepareFilePlayback(int event_index);
 	void updateMemoryLabel();
 	void selectAngle(int angle);
 	void rebuildEventList();

@@ -18,6 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "playback-engine.hpp"
 #include "angle-manager.hpp"
+#include "playback/clip-file-player.hpp"
 
 #include <obs.h>
 
@@ -160,11 +161,18 @@ bool PlaybackEngine::play(const Clip &clip, double speed)
 		return false;
 
 	std::lock_guard<std::mutex> lock(mutex_);
+	obs_video_info ovi = {};
+	if (obs_get_video_info(&ovi)) {
+		ring_colorspace_ = ovi.colorspace;
+		ring_range_ = ovi.range;
+	}
+
 	clip_ = clip;
 	speed_ = clamp_speed(speed);
 	anchor_wall_ns_ = obs_get_video_frame_time();
 	anchor_src_ns_ = 0;
 	last_emitted_seq_ = 0;
+	last_emitted_from_file_ = false;
 	has_emitted_ = false;
 	playing_ = true;
 	return true;
@@ -253,48 +261,99 @@ FramePick PlaybackEngine::next_frame()
 	}
 
 	/*
-	 * Cameras are looked up by timestamp within their own ring; clip sequence numbers only mean
-	 * something in the programme ring. A camera that does not cover this instant falls back to
-	 * the programme picture instead of freezing the replay.
+	 * Each angle can come from two places: the ring, while it still holds the moment, or the file
+	 * saved at MARK once the ring has moved on. Rings are frozen for the whole replay (the
+	 * director pauses them), so this choice is stable from tick to tick.
 	 */
 	AngleManager &angles = AngleManager::instance();
+	ClipFilePlayer &files = ClipFilePlayer::instance();
 	const uint64_t wanted_ts = clip_.ts_in + position;
-	int angle = angles.active_angle();
-	if (angle != kProgramAngle && !angles.angle(angle).covers(wanted_ts))
-		angle = kProgramAngle;
 
-	const FrameRing &ring = angles.angle(angle).ring();
-	uint64_t seq = 0;
-	bool found;
-	if (angle == kProgramAngle) {
-		found = ring.find_by_timestamp(wanted_ts, clip_.seq_in, clip_.seq_out, seq);
-	} else {
-		/* Whole ring, gap marker included: see AngleCapture::covers(). */
-		const uint64_t head = ring.head();
-		found = head > 0 && ring.find_by_timestamp(wanted_ts, ring.oldest(), head - 1, seq);
-	}
+	auto from_ring = [&](int angle) {
+		const AngleCapture &capture = angles.angle(angle);
+		if (!capture.covers(wanted_ts))
+			return false;
 
-	if (!found) {
-		/* The clip fell out of the ring (only possible while recording keeps running). */
-		playing_ = false;
-		pick.finished = true;
+		const FrameRing &ring = capture.ring();
+		uint64_t seq = 0;
+		bool found;
+		if (angle == kProgramAngle) {
+			found = ring.find_by_timestamp(wanted_ts, clip_.seq_in, clip_.seq_out, seq);
+		} else {
+			/* Whole ring, gap marker included: see AngleCapture::covers(). */
+			const uint64_t head = ring.head();
+			found = head > 0 && ring.find_by_timestamp(wanted_ts, ring.oldest(), head - 1, seq);
+		}
+		if (!found)
+			return false;
+
+		/*
+		 * Below 100 % the same source frame covers several ticks. Emitting it once is enough: the
+		 * async source keeps showing the last frame, and skipping saves a full frame copy per tick.
+		 */
+		if (has_emitted_ && !last_emitted_from_file_ && seq == last_emitted_seq_ &&
+		    angle == last_emitted_angle_)
+			return true;
+
+		if (!ring.read(seq, pick.meta, pick.planes))
+			return true;
+
+		pick.format = ring.config().format;
+		pick.colorspace = ring_colorspace_;
+		pick.range = ring_range_;
+		last_emitted_angle_ = angle;
+		last_emitted_seq_ = seq;
+		last_emitted_from_file_ = false;
+		has_emitted_ = true;
+		pick.has_frame = true;
+		return true;
+	};
+
+	auto from_file = [&](int angle) {
+		DecodedFrame decoded;
+		if (!files.pick(angle, wanted_ts, decoded))
+			return false;
+
+		const uint64_t id = static_cast<uint64_t>(decoded.id);
+		if (has_emitted_ && last_emitted_from_file_ && id == last_emitted_seq_ && angle == last_emitted_angle_)
+			return true;
+
+		pick.meta = FrameMeta{};
+		pick.meta.timestamp = decoded.timestamp;
+		pick.meta.width = decoded.width;
+		pick.meta.height = decoded.height;
+		for (size_t plane = 0; plane < MAX_AV_PLANES; ++plane) {
+			pick.meta.linesize[plane] = decoded.linesize[plane];
+			pick.planes[plane] = decoded.planes[plane];
+		}
+		pick.format = decoded.format;
+		pick.colorspace = decoded.colorspace;
+		pick.range = decoded.range;
+		pick.keepalive = decoded.keepalive;
+
+		last_emitted_angle_ = angle;
+		last_emitted_seq_ = id;
+		last_emitted_from_file_ = true;
+		has_emitted_ = true;
+		pick.has_frame = true;
+		return true;
+	};
+
+	const int wanted_angle = angles.active_angle();
+	if (from_ring(wanted_angle) || from_file(wanted_angle))
 		return pick;
-	}
+
+	/* The chosen angle cannot serve this instant — show the programme rather than freeze. */
+	if (wanted_angle != kProgramAngle && (from_ring(kProgramAngle) || from_file(kProgramAngle)))
+		return pick;
 
 	/*
-	 * Below 100 % the same source frame covers several ticks. Emitting it once is enough: the
-	 * async source keeps showing the last frame, and skipping saves a full frame copy per tick.
+	 * Nothing to show yet. If a decoder is still opening, hold the last picture instead of cutting
+	 * the replay short; give up only when there is no file to wait for.
 	 */
-	if (has_emitted_ && seq == last_emitted_seq_ && angle == last_emitted_angle_)
-		return pick;
-
-	if (!ring.read(seq, pick.meta, pick.planes))
-		return pick;
-
-	pick.format = ring.config().format;
-	last_emitted_angle_ = angle;
-	last_emitted_seq_ = seq;
-	has_emitted_ = true;
-	pick.has_frame = true;
+	if (!files.has_source(wanted_angle) && !files.has_source(kProgramAngle)) {
+		playing_ = false;
+		pick.finished = true;
+	}
 	return pick;
 }

@@ -28,6 +28,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "core/replay-source.hpp"
 #include "core/view-tap.hpp"
 #include "export/clip-exporter.hpp"
+#include "playback/clip-file-player.hpp"
 #include "ui/replay-dock.hpp"
 
 OBS_DECLARE_MODULE()
@@ -84,8 +85,10 @@ static void on_frontend_event(enum obs_frontend_event event, void *)
 		PluginSettings::instance().save();
 		/* The exporter reads the ring: it has to finish before the ring goes away. */
 		ClipExporter::instance().shutdown();
-		/* Drop the raw callback before libobs starts tearing the video pipeline down. */
+		/* Stop playback first, then join the decoders it was reading from. */
 		ReplayDirector::instance().reset();
+		ClipFilePlayer::instance().close_all();
+		/* Drop the raw callback before libobs starts tearing the video pipeline down. */
 		AngleManager::instance().stop_all();
 		break;
 	default:
@@ -131,6 +134,7 @@ void obs_module_unload(void)
 	obs_frontend_remove_event_callback(on_frontend_event, nullptr);
 	ClipExporter::instance().shutdown();
 	ReplayDirector::instance().reset();
+	ClipFilePlayer::instance().close_all();
 	AngleManager::instance().stop_all();
 
 	if (dock_widget) {

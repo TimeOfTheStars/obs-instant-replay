@@ -31,8 +31,9 @@ namespace {
 struct ReplaySource {
 	obs_source_t *source = nullptr;
 
-	/* Colour conversion parameters, recomputed only when the buffer format changes. */
+	/* Colour conversion parameters, recomputed only when the incoming frame changes character. */
 	video_format colour_format = VIDEO_FORMAT_NONE;
+	video_colorspace colour_space = VIDEO_CS_DEFAULT;
 	video_range_type range = VIDEO_RANGE_DEFAULT;
 	float colour_matrix[16] = {};
 	float colour_range_min[3] = {};
@@ -63,25 +64,25 @@ void replay_source_destroy(void *data)
 	delete static_cast<ReplaySource *>(data);
 }
 
-bool update_colour_parameters(ReplaySource *context, video_format format)
+bool update_colour_parameters(ReplaySource *context, video_format format, video_colorspace space,
+			      video_range_type range)
 {
-	if (context->colour_valid && context->colour_format == format)
+	if (context->colour_valid && context->colour_format == format && context->colour_space == space &&
+	    context->range == range)
 		return true;
-
-	obs_video_info ovi = {};
-	if (!obs_get_video_info(&ovi))
-		return false;
 
 	/*
 	 * obs_source_frame2 carries no colour space field: without the matrix filled in, the replay
-	 * comes out grey or blown out.
+	 * comes out grey or blown out. Frames from a saved file carry their own colour description,
+	 * which may differ from the current video settings, so it is part of the cache key.
 	 */
-	if (!video_format_get_parameters_for_format(ovi.colorspace, ovi.range, format, context->colour_matrix,
+	if (!video_format_get_parameters_for_format(space, range, format, context->colour_matrix,
 						    context->colour_range_min, context->colour_range_max))
 		return false;
 
 	context->colour_format = format;
-	context->range = ovi.range;
+	context->colour_space = space;
+	context->range = range;
 	context->colour_valid = true;
 	return true;
 }
@@ -97,8 +98,13 @@ void replay_source_video_tick(void *data, float)
 	if (!pick.has_frame)
 		return;
 
+	obs_video_info ovi = {};
+	obs_get_video_info(&ovi);
+
 	const video_format format = pick.format;
-	if (!update_colour_parameters(context, format))
+	const video_colorspace space = pick.colorspace != VIDEO_CS_DEFAULT ? pick.colorspace : ovi.colorspace;
+	const video_range_type range = pick.range != VIDEO_RANGE_DEFAULT ? pick.range : ovi.range;
+	if (!update_colour_parameters(context, format, space, range))
 		return;
 
 	obs_source_frame2 frame = {};
@@ -110,7 +116,7 @@ void replay_source_video_tick(void *data, float)
 	frame.width = pick.meta.width;
 	frame.height = pick.meta.height;
 	frame.format = format;
-	frame.range = context->range;
+	frame.range = range;
 	/*
 	 * The timestamp is the current OBS time, not the (stretched) source one: slow motion comes
 	 * from sampling the ring more slowly, not from re-timing the output.
