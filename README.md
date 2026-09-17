@@ -88,10 +88,16 @@ obs-websocket и Stream Deck (`TriggerHotkeyByName`):
 
 ### Windows (продакшен)
 
-Собирается в GitHub Actions (`windows-2022`, Visual Studio 17 2022). Артефакт — zip вида
-`instant-replay-for-obs-<version>-windows-x64.zip`.
+Собирается в GitHub Actions (`windows-2022`, Visual Studio 17 2022). На каждый тег вида `X.Y.Z`
+создаётся релиз с двумя файлами:
 
-Установка: распаковать содержимое архива в `C:\ProgramData\obs-studio\plugins\`, чтобы получилось
+- `instant-replay-for-obs-<version>-windows-x64-installer.exe` — **установщик** (Inno Setup).
+  Ставит плагин в `C:\ProgramData\obs-studio\plugins\instant-replay-for-obs\`, требует прав
+  администратора, просит закрыть OBS, умеет удаляться через «Приложения и возможности».
+  Установщик не подписан — SmartScreen покажет предупреждение «Неизвестный издатель»,
+  нажмите «Подробнее → Выполнить в любом случае».
+- `instant-replay-for-obs-<version>-windows-x64.zip` — то же плюс `.pdb`, для ручной установки:
+  распаковать в `C:\ProgramData\obs-studio\plugins\`, чтобы получилось
 
 ```
 C:\ProgramData\obs-studio\plugins\instant-replay-for-obs\bin\64bit\instant-replay-for-obs.dll

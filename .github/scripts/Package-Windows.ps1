@@ -67,6 +67,31 @@ function Package {
     }
     Compress-Archive -Force @CompressArgs
     Log-Group
+
+    # Inno Setup ships on the GitHub Windows runners; locally it is optional.
+    $IsccCandidates = @(
+        "${Env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe",
+        "${Env:ProgramFiles}/Inno Setup 6/ISCC.exe"
+    )
+    $Iscc = $IsccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if ( $Iscc ) {
+        Log-Group "Building installer for ${ProductName}..."
+        Remove-Item -ErrorAction SilentlyContinue -Path "${ProjectRoot}/release/${ProductName}-*-windows-*-installer.exe"
+
+        $IsccArgs = @(
+            "/DProductName=${ProductName}",
+            "/DDisplayName=$($BuildSpec.displayName)",
+            "/DProductVersion=${ProductVersion}",
+            "/DSourceDir=$(Resolve-Path "${ProjectRoot}/release/${Configuration}")",
+            "/DOutputDir=$(Resolve-Path "${ProjectRoot}/release")",
+            "${ProjectRoot}/installer/windows/installer.iss"
+        )
+        Invoke-External $Iscc @IsccArgs
+        Log-Group
+    } else {
+        Log-Warning 'Inno Setup (ISCC.exe) not found, skipping installer.'
+    }
 }
 
 Package
