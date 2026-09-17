@@ -27,7 +27,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  */
 struct PluginSettings {
 	/* Capture */
-	double buffer_seconds = 10.0;
+	/* Two seconds longer than the default clip: the export needs headroom before the ring overwrites it. */
+	double buffer_seconds = 12.0;
 	uint32_t frame_rate_divisor = 1;
 
 	/* Panel */

@@ -57,6 +57,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 namespace {
 
 constexpr int kStatusIntervalMs = 100; /* 10 Hz is enough for a buffer gauge */
+
+/*
+ * A clip as long as the ring has its first frame overwritten ~20 ms after MARK, before an export
+ * can even open the encoder. Keeping this much of the ring free of clips gives the export a head
+ * start of ~100 frames at 50 fps.
+ */
+constexpr double kExportGuardSec = 2.0;
 constexpr int kSpeeds[] = {25, 50, 75, 100};
 
 QLabel *makeBadge(const QString &text)
@@ -278,6 +285,8 @@ QWidget *ReplayDock::buildCaptureRow()
 	form->addRow(obs_module_text("Replay.Length"), length_spin);
 	form->addRow(obs_module_text("Replay.Offset"), offset_spin);
 	form->addRow(obs_module_text("Replay.BufferLength"), buffer_spin);
+
+	clampClipLength();
 
 	connect(length_spin, &QDoubleSpinBox::valueChanged, this, &ReplayDock::onSettingsChanged);
 	connect(offset_spin, &QDoubleSpinBox::valueChanged, this, &ReplayDock::onSettingsChanged);
@@ -593,8 +602,18 @@ void ReplayDock::cycleSpeed()
 	onSpeedChanged(next);
 }
 
+void ReplayDock::clampClipLength()
+{
+	const double limit = std::max(1.0, buffer_spin->value() - offset_spin->value() - kExportGuardSec);
+	length_spin->setMaximum(limit);
+	length_spin->setToolTip(
+		QStringLiteral("%1 %2 s").arg(obs_module_text("Replay.Length.Limit")).arg(limit, 0, 'f', 1));
+}
+
 void ReplayDock::onSettingsChanged()
 {
+	clampClipLength();
+
 	PluginSettings &settings = PluginSettings::instance();
 	settings.clip_length_sec = length_spin->value();
 	settings.clip_trim_sec = offset_spin->value();
@@ -607,6 +626,8 @@ void ReplayDock::applyBufferSetting()
 {
 	PluginSettings &settings = PluginSettings::instance();
 	settings.buffer_seconds = buffer_spin->value();
+	clampClipLength();
+	settings.clip_length_sec = length_spin->value();
 	save_timer->start();
 
 	if (!ProgramCapture::instance().running())

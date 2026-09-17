@@ -209,8 +209,13 @@ void FrameRing::write(const uint8_t *const source[MAX_AV_PLANES], const uint32_t
 
 uint64_t FrameRing::oldest() const
 {
+	/*
+	 * Once the ring has wrapped, slot (head - capacity) is the one the writer is copying into right
+	 * now: its pixels change before its metadata does, so it must not be handed to readers. The
+	 * oldest readable frame is therefore one past it, and the effective capacity is N - 1.
+	 */
 	const uint64_t current_head = head();
-	return current_head > capacity_ ? current_head - capacity_ : 0;
+	return current_head >= capacity_ ? current_head - capacity_ + 1 : 0;
 }
 
 bool FrameRing::read(uint64_t seq, FrameMeta &meta, const uint8_t *planes[MAX_AV_PLANES]) const

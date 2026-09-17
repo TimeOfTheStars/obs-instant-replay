@@ -110,6 +110,7 @@ private:
 
 	bool play(int event_index);
 	int selectedEvent() const;
+	void clampClipLength();
 	void rebuildEventList();
 	void updateEventItem(int event_index);
 	void showSelection(int event_index);
