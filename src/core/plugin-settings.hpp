@@ -31,12 +31,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  */
 struct PluginSettings {
 	/* Capture */
-	/* Two seconds longer than the default clip: the export needs headroom before the ring overwrites it. */
-	double buffer_seconds = 12.0;
+	/* Three seconds longer than the default clip: the exports need headroom before the ring overwrites it. */
+	double buffer_seconds = 8.0;
 	uint32_t frame_rate_divisor = 1;
 
 	/* Panel */
-	double clip_length_sec = 10.0;
+	double clip_length_sec = 5.0;
 	double clip_trim_sec = 0.0;
 	int speed_percent = 100;
 	bool auto_return = true;

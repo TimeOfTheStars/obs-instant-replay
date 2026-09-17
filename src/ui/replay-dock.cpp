@@ -69,10 +69,10 @@ constexpr int kStatusIntervalMs = 100; /* 10 Hz is enough for a buffer gauge */
 
 /*
  * A clip as long as the ring has its first frame overwritten ~20 ms after MARK, before an export
- * can even open the encoder. Keeping this much of the ring free of clips gives the export a head
- * start of ~100 frames at 50 fps.
+ * can even open the encoder. Several angles start their encoders at once, so the head start has to
+ * cover the slowest of them — including a failed hardware probe falling back to x264.
  */
-constexpr double kExportGuardSec = 2.0;
+constexpr double kExportGuardSec = 3.0;
 constexpr int kSpeeds[] = {25, 50, 75, 100};
 
 QLabel *makeBadge(const QString &text)
@@ -308,7 +308,7 @@ QWidget *ReplayDock::buildCaptureRow()
 
 	/* How much footage the ring keeps; changing it reallocates, so it is applied on commit. */
 	buffer_spin = new QDoubleSpinBox(box);
-	buffer_spin->setRange(3.0, 60.0);
+	buffer_spin->setRange(5.0, 60.0);
 	buffer_spin->setSingleStep(1.0);
 	buffer_spin->setValue(PluginSettings::instance().buffer_seconds);
 	buffer_spin->setSuffix(QStringLiteral(" s"));
@@ -542,6 +542,24 @@ void ReplayDock::updateMemoryLabel()
 				      QStringLiteral("   ·   %1 %2 s")
 					      .arg(obs_module_text("Replay.Angles.Memory.Trimmed"))
 					      .arg(fitted, 0, 'f', 1));
+
+	/*
+	 * The one place the operator can see how ticking another angle costs memory and shortens the
+	 * longest clip they are allowed to mark.
+	 */
+	int files = 0;
+	for (int angle = 0; angle < kAngleCount; ++angle) {
+		if (settings.export_enabled && settings.export_angles[static_cast<size_t>(angle)])
+			++files;
+	}
+
+	QString second = QStringLiteral("%1 %2 s")
+				 .arg(obs_module_text("Replay.Angles.Memory.ClipLimit"))
+				 .arg(length_spin ? length_spin->maximum() : 0.0, 0, 'f', 1);
+	if (files > 0)
+		second += QStringLiteral("   ·   %1 %2").arg(obs_module_text("Replay.Angles.Memory.Files")).arg(files);
+	/* Second line of the same label: wordWrap is already on, so it simply wraps underneath. */
+	memory_label->setText(memory_label->text() + QStringLiteral("\n") + second);
 }
 
 void ReplayDock::onAngleClicked(int angle)
@@ -1156,7 +1174,16 @@ void ReplayDock::cycleSpeed()
 
 void ReplayDock::clampClipLength()
 {
-	const double limit = std::max(1.0, buffer_spin->value() - offset_spin->value() - kExportGuardSec);
+	/*
+	 * Clamp against what the ring actually holds, not what was asked for: the memory budget can
+	 * shrink every ring silently, and a clip longer than the ring is exported truncated with no
+	 * explanation.
+	 */
+	AngleManager &angles = AngleManager::instance();
+	const double buffered = angles.program_running() ? angles.active_duration() : buffer_spin->value();
+	const double guard = PluginSettings::instance().export_enabled ? kExportGuardSec : 1.0;
+	const double limit = std::max(1.0, buffered - offset_spin->value() - guard);
+
 	length_spin->setMaximum(limit);
 	length_spin->setToolTip(
 		QStringLiteral("%1 %2 s").arg(obs_module_text("Replay.Length.Limit")).arg(limit, 0, 'f', 1));
