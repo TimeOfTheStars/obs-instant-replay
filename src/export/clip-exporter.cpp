@@ -37,6 +37,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 #ifdef _WIN32
 /* windows.h defines min/max as macros, which breaks std::max below. */
@@ -49,6 +50,11 @@ namespace {
 /* Frames still missing after this many attempts at the clip start mean the head is gone for good. */
 constexpr double kMaxLeadingLossSec = 1.0;
 
+/*
+ * FFmpeg explains failures only through av_log, and OBS already routes that callback into its own
+ * log (obs-ffmpeg), so the detailed reason for an encoder failure is in the OBS log as "[ffmpeg]"
+ * lines right before our "export #N" warning.
+ */
 std::string ffmpeg_error(int code)
 {
 	char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -61,9 +67,28 @@ std::string ffmpeg_error(int code)
  * is free for x264, otherwise NVENC (when the FFmpeg build has it) keeps x264 threads off the
  * cores the stream encoder needs.
  */
+/*
+ * "Compiled in" is not "usable": FFmpeg always reports h264_nvenc when it was built with NVENC
+ * support, and on a machine without an NVIDIA driver opening it fails with a bare -1 from the
+ * dynamic loader ("Operation not permitted" on Windows). OBS itself only registers its NVENC
+ * encoders after probing the hardware, so that registry is the reliable signal.
+ */
+bool nvidia_encoder_available()
+{
+	if (!avcodec_find_encoder_by_name("h264_nvenc"))
+		return false;
+
+	static const char *obs_nvenc_ids[] = {"obs_nvenc_h264_tex", "obs_nvenc_h264_cuda", "jim_nvenc", "ffmpeg_nvenc"};
+	for (const char *id : obs_nvenc_ids) {
+		if (obs_get_encoder_codec(id))
+			return true;
+	}
+	return false;
+}
+
 std::string resolve_encoder(const std::string &requested)
 {
-	const bool have_nvenc = avcodec_find_encoder_by_name("h264_nvenc") != nullptr;
+	const bool have_nvenc = nvidia_encoder_available();
 
 	if (requested == "x264")
 		return "libx264";
@@ -295,43 +320,88 @@ void ClipExporter::run(const Job &job)
 		return;
 	}
 
-	const AVCodec *codec = avcodec_find_encoder_by_name(job.encoder.c_str());
-	if (!codec)
-		codec = avcodec_find_encoder_by_name("libx264");
+	/*
+	 * Try the preferred encoder first, then whatever else this FFmpeg build can offer. Hardware
+	 * encoders fail to open for all sorts of machine-specific reasons (driver, session limits,
+	 * missing runtime), and one bad encoder must not cost the operator the clip.
+	 */
+	const char *candidates[] = {job.encoder.c_str(), "libx264",  "h264_nvenc",
+				    "h264_amf",          "h264_qsv", "libopenh264"};
+	std::string open_errors;
+	const AVCodec *codec = nullptr;
+
+	for (const char *name : candidates) {
+		const AVCodec *candidate = avcodec_find_encoder_by_name(name);
+		if (!candidate)
+			continue;
+		if (strcmp(name, "h264_nvenc") == 0 && !nvidia_encoder_available())
+			continue;
+
+		bool already_tried = false;
+		for (const char *earlier : candidates) {
+			if (earlier == name)
+				break;
+			if (strcmp(earlier, name) == 0)
+				already_tried = true;
+		}
+		if (already_tried)
+			continue;
+
+		avcodec_free_context(&session.codec);
+		session.codec = avcodec_alloc_context3(candidate);
+		session.codec->width = static_cast<int>(config.width);
+		session.codec->height = static_cast<int>(config.height);
+		session.codec->pix_fmt = pixel_format;
+		session.codec->time_base = time_base;
+		session.codec->framerate = {time_base.den, time_base.num};
+		session.codec->gop_size = static_cast<int>(2.0 * config.fps);
+		session.codec->max_b_frames = 2;
+		apply_colour(session.codec, ovi);
+		if (session.format->oformat->flags & AVFMT_GLOBALHEADER)
+			session.codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+		if (strcmp(candidate->name, "libx264") == 0) {
+			/* Leave most cores to the stream encoder; veryfast still beats 50 fps on a modest CPU. */
+			session.codec->thread_count = std::clamp(os_get_logical_cores() / 2, 2, 6);
+			av_opt_set(session.codec->priv_data, "preset", "veryfast", 0);
+			av_opt_set_int(session.codec->priv_data, "crf", job.crf, 0);
+		} else if (strcmp(candidate->name, "h264_nvenc") == 0) {
+			av_opt_set(session.codec->priv_data, "preset", "p5", 0);
+			av_opt_set(session.codec->priv_data, "rc", "constqp", 0);
+			av_opt_set_int(session.codec->priv_data, "qp", job.crf + 2, 0);
+		} else if (strcmp(candidate->name, "h264_amf") == 0) {
+			av_opt_set(session.codec->priv_data, "rc", "cqp", 0);
+			av_opt_set_int(session.codec->priv_data, "qp_i", job.crf + 2, 0);
+			av_opt_set_int(session.codec->priv_data, "qp_p", job.crf + 2, 0);
+		} else if (strcmp(candidate->name, "h264_qsv") == 0) {
+			session.codec->global_quality = job.crf + 2;
+		} else {
+			session.codec->bit_rate = 12000000;
+		}
+
+		result = avcodec_open2(session.codec, candidate, nullptr);
+		if (result >= 0) {
+			codec = candidate;
+			break;
+		}
+
+		const std::string reason = ffmpeg_error(result);
+		obs_log(LOG_WARNING, "export #%d: encoder %s failed to open: %s", job.id, candidate->name,
+			reason.c_str());
+		if (!open_errors.empty())
+			open_errors += "; ";
+		open_errors += std::string(candidate->name) + ": " + reason;
+	}
+
 	if (!codec) {
-		update(job.id, ExportState::Failed, 0, total, path, "no H.264 encoder in this FFmpeg build");
+		update(job.id, ExportState::Failed, 0, total, path,
+		       open_errors.empty() ? std::string("no H.264 encoder in this FFmpeg build")
+					   : "encoder open failed — " + open_errors);
 		return;
 	}
 
-	session.codec = avcodec_alloc_context3(codec);
-	session.codec->width = static_cast<int>(config.width);
-	session.codec->height = static_cast<int>(config.height);
-	session.codec->pix_fmt = pixel_format;
-	session.codec->time_base = time_base;
-	session.codec->framerate = {time_base.den, time_base.num};
-	session.codec->gop_size = static_cast<int>(2.0 * config.fps);
-	session.codec->max_b_frames = 2;
-	apply_colour(session.codec, ovi);
-	if (session.format->oformat->flags & AVFMT_GLOBALHEADER)
-		session.codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-	if (strcmp(codec->name, "libx264") == 0) {
-		/* Leave most cores to the stream encoder; veryfast still beats 50 fps on a modest CPU. */
-		session.codec->thread_count = std::clamp(os_get_logical_cores() / 2, 2, 6);
-		av_opt_set(session.codec->priv_data, "preset", "veryfast", 0);
-		av_opt_set(session.codec->priv_data, "profile", "high", 0);
-		av_opt_set_int(session.codec->priv_data, "crf", job.crf, 0);
-	} else {
-		av_opt_set(session.codec->priv_data, "preset", "p5", 0);
-		av_opt_set(session.codec->priv_data, "rc", "constqp", 0);
-		av_opt_set_int(session.codec->priv_data, "qp", job.crf + 2, 0);
-	}
-
-	result = avcodec_open2(session.codec, codec, nullptr);
-	if (result < 0) {
-		update(job.id, ExportState::Failed, 0, total, path, "encoder open failed: " + ffmpeg_error(result));
-		return;
-	}
+	if (strcmp(codec->name, job.encoder.c_str()) != 0)
+		obs_log(LOG_INFO, "export #%d: using %s instead of %s", job.id, codec->name, job.encoder.c_str());
 
 	session.stream = avformat_new_stream(session.format, nullptr);
 	session.stream->time_base = time_base;
