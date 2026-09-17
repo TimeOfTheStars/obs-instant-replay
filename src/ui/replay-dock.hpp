@@ -29,6 +29,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 class QButtonGroup;
 class QCheckBox;
+class QComboBox;
+class QLineEdit;
 class QDoubleSpinBox;
 class QLabel;
 class QListWidget;
@@ -74,6 +76,7 @@ private:
 	QWidget *buildTimelineRow();
 	QWidget *buildEventsBox();
 	QWidget *buildTransportRow();
+	QWidget *buildExportBox();
 
 	/* status row */
 	QProgressBar *buffer_bar = nullptr;
@@ -92,6 +95,9 @@ private:
 	QPushButton *play_button = nullptr;
 	QPushButton *stop_button = nullptr;
 	QCheckBox *auto_return_check = nullptr;
+	QCheckBox *export_check = nullptr;
+	QLineEdit *export_dir_edit = nullptr;
+	QComboBox *export_encoder_combo = nullptr;
 	QListWidget *events_list = nullptr;
 	ReplayTimeline *timeline = nullptr;
 	QLabel *timeline_label = nullptr;
@@ -102,6 +108,7 @@ private:
 	struct Event {
 		Clip clip;
 		QString name;
+		int export_job = 0; /* 0 = not exported */
 	};
 
 	/* Marked clips, in the order they were created; the list widget stores indices into this. */

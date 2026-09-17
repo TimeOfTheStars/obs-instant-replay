@@ -16,6 +16,12 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
+# Clip export encodes straight from the ring with the FFmpeg that ships in obs-deps — the same
+# build OBS itself links, so the DLLs already loaded by the OBS process satisfy the imports.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/finders")
+find_package(FFmpeg REQUIRED COMPONENTS avcodec avformat avutil)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE FFmpeg::avcodec FFmpeg::avformat FFmpeg::avutil)
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
@@ -50,6 +56,10 @@ target_sources(
     src/core/replay-director.hpp
     src/core/replay-source.cpp
     src/core/replay-source.hpp
+    src/export/clip-exporter.cpp
+    src/export/clip-exporter.hpp
+    src/export/export-path.cpp
+    src/export/export-path.hpp
     src/plugin-main.cpp
     src/ui/replay-dock.cpp
     src/ui/replay-dock.hpp

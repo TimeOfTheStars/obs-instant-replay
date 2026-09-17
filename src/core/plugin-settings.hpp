@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 /*
  * Plugin-wide settings, stored as JSON under the module config path. The frontend config is not
@@ -36,6 +37,12 @@ struct PluginSettings {
 	double clip_trim_sec = 0.0;
 	int speed_percent = 100;
 	bool auto_return = true;
+
+	/* Export: every MARK writes the programme clip to <export_dir>/<YYYY-MM-DD>/ */
+	bool export_enabled = true;
+	std::string export_dir;              /* empty = OBS recording folder */
+	std::string export_encoder = "auto"; /* auto | x264 | nvenc */
+	int export_crf = 18;
 
 	static PluginSettings &instance();
 

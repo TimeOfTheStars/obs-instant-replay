@@ -65,6 +65,10 @@ void PluginSettings::load()
 	obs_data_set_default_double(data, "clip_trim_sec", clip_trim_sec);
 	obs_data_set_default_int(data, "speed_percent", speed_percent);
 	obs_data_set_default_bool(data, "auto_return", auto_return);
+	obs_data_set_default_bool(data, "export_enabled", export_enabled);
+	obs_data_set_default_string(data, "export_dir", export_dir.c_str());
+	obs_data_set_default_string(data, "export_encoder", export_encoder.c_str());
+	obs_data_set_default_int(data, "export_crf", export_crf);
 
 	buffer_seconds = obs_data_get_double(data, "buffer_seconds");
 	frame_rate_divisor = static_cast<uint32_t>(obs_data_get_int(data, "frame_rate_divisor"));
@@ -72,6 +76,10 @@ void PluginSettings::load()
 	clip_trim_sec = obs_data_get_double(data, "clip_trim_sec");
 	speed_percent = static_cast<int>(obs_data_get_int(data, "speed_percent"));
 	auto_return = obs_data_get_bool(data, "auto_return");
+	export_enabled = obs_data_get_bool(data, "export_enabled");
+	export_dir = obs_data_get_string(data, "export_dir");
+	export_encoder = obs_data_get_string(data, "export_encoder");
+	export_crf = static_cast<int>(obs_data_get_int(data, "export_crf"));
 
 	obs_data_release(data);
 }
@@ -95,6 +103,10 @@ void PluginSettings::save() const
 	obs_data_set_double(data, "clip_trim_sec", clip_trim_sec);
 	obs_data_set_int(data, "speed_percent", speed_percent);
 	obs_data_set_bool(data, "auto_return", auto_return);
+	obs_data_set_bool(data, "export_enabled", export_enabled);
+	obs_data_set_string(data, "export_dir", export_dir.c_str());
+	obs_data_set_string(data, "export_encoder", export_encoder.c_str());
+	obs_data_set_int(data, "export_crf", export_crf);
 
 	/* Atomic write with a backup: a half-written config would lose the operator's setup. */
 	if (!obs_data_save_json_safe(data, path.c_str(), "tmp", "bak"))

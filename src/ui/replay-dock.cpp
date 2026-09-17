@@ -24,6 +24,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "core/plugin-settings.hpp"
 #include "core/program-capture.hpp"
 #include "core/replay-director.hpp"
+#include "export/clip-exporter.hpp"
 
 #include <obs-frontend-api.h>
 #include <obs-module.h>
@@ -33,6 +34,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QAbstractButton>
 #include <QButtonGroup>
 #include <QCheckBox>
+#include <QComboBox>
+#include <QFileDialog>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QFont>
@@ -92,6 +95,7 @@ ReplayDock::ReplayDock(QWidget *parent) : QWidget(parent)
 	layout->addWidget(buildSpeedRow());
 	layout->addWidget(buildTimelineRow());
 	layout->addWidget(buildEventsBox(), 1);
+	layout->addWidget(buildExportBox());
 	layout->addWidget(buildTransportRow());
 
 	setMinimumWidth(320);
@@ -359,6 +363,53 @@ QWidget *ReplayDock::buildEventsBox()
 	return box;
 }
 
+QWidget *ReplayDock::buildExportBox()
+{
+	auto *box = new QGroupBox(obs_module_text("Replay.Export"), this);
+	auto *layout = new QVBoxLayout(box);
+	layout->setContentsMargins(6, 6, 6, 6);
+	layout->setSpacing(4);
+
+	const PluginSettings &settings = PluginSettings::instance();
+
+	export_check = new QCheckBox(obs_module_text("Replay.Export.Enabled"), box);
+	export_check->setChecked(settings.export_enabled);
+	connect(export_check, &QCheckBox::toggled, this, &ReplayDock::onSettingsChanged);
+
+	auto *folder_row = new QHBoxLayout();
+	export_dir_edit = new QLineEdit(QString::fromStdString(settings.export_dir), box);
+	export_dir_edit->setPlaceholderText(obs_module_text("Replay.Export.DefaultFolder"));
+	connect(export_dir_edit, &QLineEdit::editingFinished, this, &ReplayDock::onSettingsChanged);
+	auto *browse = new QPushButton(QStringLiteral("…"), box);
+	browse->setFixedWidth(32);
+	connect(browse, &QPushButton::clicked, this, [this] {
+		const QString chosen = QFileDialog::getExistingDirectory(
+			this, obs_module_text("Replay.Export.ChooseFolder"), export_dir_edit->text());
+		if (!chosen.isEmpty()) {
+			export_dir_edit->setText(chosen);
+			onSettingsChanged();
+		}
+	});
+	folder_row->addWidget(export_dir_edit, 1);
+	folder_row->addWidget(browse);
+
+	auto *encoder_row = new QHBoxLayout();
+	encoder_row->addWidget(new QLabel(obs_module_text("Replay.Export.Encoder"), box));
+	export_encoder_combo = new QComboBox(box);
+	export_encoder_combo->addItem(obs_module_text("Replay.Export.Encoder.Auto"), QStringLiteral("auto"));
+	export_encoder_combo->addItem(QStringLiteral("x264 (CPU)"), QStringLiteral("x264"));
+	export_encoder_combo->addItem(QStringLiteral("NVENC (GPU)"), QStringLiteral("nvenc"));
+	const int current = export_encoder_combo->findData(QString::fromStdString(settings.export_encoder));
+	export_encoder_combo->setCurrentIndex(std::max(0, current));
+	connect(export_encoder_combo, &QComboBox::currentIndexChanged, this, &ReplayDock::onSettingsChanged);
+	encoder_row->addWidget(export_encoder_combo, 1);
+
+	layout->addWidget(export_check);
+	layout->addLayout(folder_row);
+	layout->addLayout(encoder_row);
+	return box;
+}
+
 QWidget *ReplayDock::buildTransportRow()
 {
 	auto *box = new QWidget(this);
@@ -399,6 +450,14 @@ void ReplayDock::onMark()
 	Event event;
 	event.clip = clip;
 	event.name = QStringLiteral("%1 %2").arg(obs_module_text("Replay.Event")).arg(events.size() + 1);
+	if (PluginSettings::instance().export_enabled) {
+		ExportOptions options;
+		options.encoder = PluginSettings::instance().export_encoder;
+		options.crf = PluginSettings::instance().export_crf;
+		options.base_dir = PluginSettings::instance().export_dir;
+		event.export_job = ClipExporter::instance().enqueue(clip, event.name.toStdString(), options);
+	}
+
 	events.push_back(event);
 
 	auto *item = new QListWidgetItem();
@@ -423,7 +482,36 @@ void ReplayDock::updateEventItem(int event_index)
 			continue;
 
 		const Event &event = events[static_cast<size_t>(event_index)];
-		item->setText(QStringLiteral("%1   %2 s").arg(event.name).arg(event.clip.duration_sec(), 0, 'f', 1));
+		QString text = QStringLiteral("%1   %2 s").arg(event.name).arg(event.clip.duration_sec(), 0, 'f', 1);
+		if (event.export_job > 0) {
+			const ExportStatus status = ClipExporter::instance().status(event.export_job);
+			switch (status.state) {
+			case ExportState::Queued:
+				text += QStringLiteral("   ● %1").arg(obs_module_text("Replay.Export.Queued"));
+				break;
+			case ExportState::Encoding: {
+				const int percent =
+					status.frames_total
+						? static_cast<int>(status.frames_done * 100 / status.frames_total)
+						: 0;
+				text += QStringLiteral("   ● %1 %2%")
+						.arg(obs_module_text("Replay.Export.Saving"))
+						.arg(percent);
+				break;
+			}
+			case ExportState::Done:
+				text += QStringLiteral("   ✓ %1").arg(obs_module_text("Replay.Export.Saved"));
+				break;
+			case ExportState::DoneTruncated:
+				text += QStringLiteral("   ✓ %1").arg(obs_module_text("Replay.Export.SavedTruncated"));
+				break;
+			case ExportState::Failed:
+				text += QStringLiteral("   ✗ %1").arg(QString::fromStdString(status.error));
+				break;
+			}
+			item->setToolTip(QString::fromStdString(status.path));
+		}
+		item->setText(text);
 		return;
 	}
 }
@@ -619,6 +707,11 @@ void ReplayDock::onSettingsChanged()
 	settings.clip_trim_sec = offset_spin->value();
 	settings.speed_percent = speed_percent;
 	settings.auto_return = auto_return_check->isChecked();
+	if (export_check) {
+		settings.export_enabled = export_check->isChecked();
+		settings.export_dir = export_dir_edit->text().trimmed().toStdString();
+		settings.export_encoder = export_encoder_combo->currentData().toString().toStdString();
+	}
 	save_timer->start();
 }
 
@@ -657,6 +750,12 @@ void ReplayDock::onSpeedChanged(int percent)
 
 void ReplayDock::refreshStatus()
 {
+	/* Export progress lives in the list items; a handful of rows at 10 Hz is cheap to repaint. */
+	for (size_t index = 0; index < events.size(); ++index) {
+		if (events[index].export_job > 0)
+			updateEventItem(static_cast<int>(index));
+	}
+
 	ProgramCapture::instance().poll_video_settings();
 	ReplayDirector::instance().poll();
 

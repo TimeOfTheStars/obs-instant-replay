@@ -26,6 +26,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "core/program-capture.hpp"
 #include "core/replay-director.hpp"
 #include "core/replay-source.hpp"
+#include "export/clip-exporter.hpp"
 #include "ui/replay-dock.hpp"
 
 OBS_DECLARE_MODULE()
@@ -78,6 +79,8 @@ static void on_frontend_event(enum obs_frontend_event event, void *)
 		break;
 	case OBS_FRONTEND_EVENT_EXIT:
 		PluginSettings::instance().save();
+		/* The exporter reads the ring: it has to finish before the ring goes away. */
+		ClipExporter::instance().shutdown();
 		/* Drop the raw callback before libobs starts tearing the video pipeline down. */
 		ReplayDirector::instance().reset();
 		ProgramCapture::instance().stop();
@@ -122,6 +125,7 @@ bool obs_module_load(void)
 void obs_module_unload(void)
 {
 	obs_frontend_remove_event_callback(on_frontend_event, nullptr);
+	ClipExporter::instance().shutdown();
 	ReplayDirector::instance().reset();
 	ProgramCapture::instance().stop();
 
