@@ -133,6 +133,9 @@ private:
 		std::string encoder; /* resolved: libx264 | h264_nvenc | … */
 		int crf = 18;
 		int thread_budget = 0;
+		/* Claimed at MARK, released when the job ends: keeps the writer off the clip. */
+		uint64_t seq_begin = 0;
+		int floor_token = -1;
 	};
 
 	void ensure_workers();

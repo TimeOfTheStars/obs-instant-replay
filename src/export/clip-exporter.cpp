@@ -310,6 +310,23 @@ int ClipExporter::enqueue(int angle, const Clip &clip, const std::string &path, 
 	job.crf = std::clamp(options.crf, 10, 30);
 	job.thread_budget = options.thread_budget;
 
+	/*
+	 * Claim the clip here, on the Qt thread, rather than inside the worker: between MARK and a
+	 * worker actually starting, the capture thread would otherwise be free to overwrite the head
+	 * of the clip — which is exactly what made the angle queued last come out incomplete.
+	 */
+	{
+		AngleManager &angles = AngleManager::instance();
+		AngleCapture &capture = angles.angle(angle);
+		if (capture.running()) {
+			const auto guard = angles.reader_guard();
+			FrameRing &ring = capture.ring();
+			const uint64_t head = ring.head();
+			if (head > 0 && ring.find_by_timestamp(clip.ts_in, ring.oldest(), head - 1, job.seq_begin))
+				job.floor_token = ring.acquire_floor(job.seq_begin);
+		}
+	}
+
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		job.id = next_id_++;
@@ -353,6 +370,12 @@ void ClipExporter::shutdown()
 	stop_.store(true, std::memory_order_release);
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
+		/* Queued jobs never reach a worker, so their claim on the ring has to be dropped here. */
+		AngleManager &angles = AngleManager::instance();
+		for (const Job &job : queue_) {
+			if (job.floor_token >= 0 && angles.angle(job.angle).running())
+				angles.angle(job.angle).ring().release_floor(job.floor_token);
+		}
 		queue_.clear();
 	}
 	wake_.notify_all();
@@ -487,6 +510,7 @@ void ClipExporter::run(const Job &job)
 
 	std::string error;
 	const uint64_t started = os_gettime_ns();
+	const uint64_t held_back_before = ring.frames_held_back();
 	obs_log(LOG_INFO, "export #%d: angle %d -> %s, ~%llu frames, encoder %s", job.id, job.angle, path.c_str(),
 		static_cast<unsigned long long>(total), job.encoder.c_str());
 
@@ -658,9 +682,16 @@ void ClipExporter::run(const Job &job)
 	int64_t last_pts = -1;
 	bool truncated = false;
 
-	/* Frames are found by timestamp: clip sequence numbers only mean something in the programme ring. */
-	uint64_t seq = 0;
-	{
+	/* The range was claimed at MARK; release it whichever way this job ends. */
+	struct FloorGuard {
+		FrameRing &ring;
+		int token;
+		~FloorGuard() { ring.release_floor(token); }
+	} floor{ring, job.floor_token};
+
+	uint64_t seq = job.seq_begin;
+	if (job.floor_token < 0) {
+		/* Nothing was claimed (the buffer was not running yet) — find the start and hope. */
 		const auto guard = angles.reader_guard();
 		const uint64_t head = ring.head();
 		if (head == 0 || !ring.find_by_timestamp(job.clip.ts_in, ring.oldest(), head - 1, seq)) {
@@ -668,17 +699,6 @@ void ClipExporter::run(const Job &job)
 			return;
 		}
 	}
-
-	/*
-	 * Claim everything from here on so the capture thread cannot overwrite the clip while it is
-	 * being encoded. Without this the angle that starts encoding last — camera 2, then camera 3 —
-	 * loses the head of its clip and the file comes out incomplete.
-	 */
-	struct FloorGuard {
-		FrameRing &ring;
-		int token;
-		~FloorGuard() { ring.release_floor(token); }
-	} floor{ring, ring.acquire_floor(seq)};
 
 	/* Guards against spinning if the writer keeps outrunning us while nothing has been written yet. */
 	int skips = 0;
@@ -836,7 +856,7 @@ void ClipExporter::run(const Job &job)
 		return;
 	}
 
-	const uint64_t held_back = ring.frames_held_back();
+	const uint64_t held_back = ring.frames_held_back() - held_back_before;
 	if (held_back > 0)
 		obs_log(LOG_WARNING, "export #%d: the live buffer dropped %llu frames waiting for this export", job.id,
 			static_cast<unsigned long long>(held_back));

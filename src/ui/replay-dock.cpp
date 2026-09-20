@@ -69,11 +69,11 @@ namespace {
 constexpr int kStatusIntervalMs = 100; /* 10 Hz is enough for a buffer gauge */
 
 /*
- * A clip as long as the ring has its first frame overwritten ~20 ms after MARK, before an export
- * can even open the encoder. Several angles start their encoders at once, so the head start has to
- * cover the slowest of them — including a failed hardware probe falling back to x264.
+ * The export claims its frames the moment MARK is pressed, so the ring can no longer overwrite them
+ * while an encoder starts up. This margin only has to cover the handful of frames between the clip's
+ * out point and the live edge.
  */
-constexpr double kExportGuardSec = 3.0;
+constexpr double kExportGuardSec = 1.0;
 constexpr int kSpeeds[] = {25, 50, 75, 100};
 
 QLabel *makeBadge(const QString &text)
