@@ -20,7 +20,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <media-io/video-io.h>
 
+#include <array>
 #include <atomic>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -70,6 +72,19 @@ public:
 	bool reconfigure(const RingConfig &config);
 	void release();
 
+	/*
+	 * Reader protection. An export reads frames while the capture thread keeps writing, and on a
+	 * short ring the writer wins: the clip loses its head and the file comes out incomplete.
+	 * A reader registers the oldest sequence it still needs; the writer then drops incoming frames
+	 * rather than overwriting it. In the normal case the reader keeps ahead and nothing is dropped.
+	 */
+	int acquire_floor(uint64_t seq);
+	void update_floor(int token, uint64_t seq);
+	void release_floor(int token);
+
+	/* Frames the writer had to drop because a reader was still using the slot. */
+	uint64_t frames_held_back() const { return held_back_.load(std::memory_order_relaxed); }
+
 	/* Producer side: called from the video-io thread only. */
 	void write(const uint8_t *const source[MAX_AV_PLANES], const uint32_t source_linesize[MAX_AV_PLANES],
 		   uint64_t timestamp, bool starts_gap);
@@ -116,6 +131,13 @@ private:
 
 	std::atomic<uint64_t> head_{0};
 	std::atomic<uint64_t> gap_seq_{0};
+
+	static constexpr size_t kMaxReaders = 4;
+	mutable std::mutex floor_mutex_;
+	std::array<uint64_t, kMaxReaders> floors_ = {};
+	std::atomic<uint64_t> min_floor_{UINT64_MAX};
+	std::atomic<uint64_t> held_back_{0};
+	bool resume_gap_ = false;
 };
 
 /* Number of planes and their row counts for the formats the plugin supports. */

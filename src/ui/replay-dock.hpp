@@ -67,6 +67,9 @@ public slots:
 	/* Scenes changed (added, renamed, collection switched): refill the camera pickers. */
 	void refreshSceneList();
 
+	/* Encoders register while modules load, so the list is filled once the frontend is up. */
+	void refreshEncoderList();
+
 private slots:
 	void onSpeedChanged(int speed_percent);
 	void onEventActivated();

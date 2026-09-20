@@ -46,6 +46,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QLabel>
 #include <QListWidget>
 #include <QProgressBar>
+#include <QSignalBlocker>
 #include <QScrollArea>
 #include <QPushButton>
 #include <QTimer>
@@ -136,6 +137,7 @@ ReplayDock::ReplayDock(QWidget *parent) : QWidget(parent)
 
 	registerHotkeys();
 	refreshSceneList();
+	refreshEncoderList();
 
 	status_timer = new QTimer(this);
 	connect(status_timer, &QTimer::timeout, this, &ReplayDock::refreshStatus);
@@ -465,6 +467,29 @@ void ReplayDock::refreshSceneList()
 	updateMemoryLabel();
 }
 
+void ReplayDock::refreshEncoderList()
+{
+	if (!export_encoder_combo)
+		return;
+
+	const QString previous = export_encoder_combo->currentData().toString();
+	const QSignalBlocker blocker(export_encoder_combo);
+
+	export_encoder_combo->clear();
+	export_encoder_combo->addItem(obs_module_text("Replay.Export.Encoder.Auto"), QStringLiteral("auto"));
+
+	/* Exactly what OBS lists in its own output settings, minus anything we cannot drive. */
+	for (const EncoderChoice &choice : available_encoders()) {
+		export_encoder_combo->addItem(QString::fromStdString(choice.display_name),
+					      QString::fromStdString(choice.obs_id));
+	}
+
+	const QString wanted = previous.isEmpty() ? QString::fromStdString(PluginSettings::instance().export_encoder)
+						  : previous;
+	const int index = export_encoder_combo->findData(wanted);
+	export_encoder_combo->setCurrentIndex(index >= 0 ? index : 0);
+}
+
 void ReplayDock::onCameraSettingsChanged()
 {
 	if (scene_list_updating)
@@ -668,19 +693,6 @@ QWidget *ReplayDock::buildExportBox()
 	folder_row->addWidget(export_dir_edit, 1);
 	folder_row->addWidget(browse);
 
-	auto *encoder_row = new QHBoxLayout();
-	encoder_row->addWidget(new QLabel(obs_module_text("Replay.Export.Encoder"), box));
-	export_encoder_combo = new QComboBox(box);
-	export_encoder_combo->addItem(obs_module_text("Replay.Export.Encoder.Auto"), QStringLiteral("auto"));
-	export_encoder_combo->addItem(QStringLiteral("x264 (CPU)"), QStringLiteral("x264"));
-	export_encoder_combo->addItem(QStringLiteral("NVENC (NVIDIA GPU)"), QStringLiteral("nvenc"));
-	export_encoder_combo->addItem(QStringLiteral("AMF (AMD GPU)"), QStringLiteral("amf"));
-	export_encoder_combo->addItem(QStringLiteral("QSV (Intel GPU)"), QStringLiteral("qsv"));
-	const int current = export_encoder_combo->findData(QString::fromStdString(settings.export_encoder));
-	export_encoder_combo->setCurrentIndex(std::max(0, current));
-	connect(export_encoder_combo, &QComboBox::currentIndexChanged, this, &ReplayDock::onSettingsChanged);
-	encoder_row->addWidget(export_encoder_combo, 1);
-
 	/* Which angles MARK writes: one narrow checkbox each, so the row fits a 320 px dock. */
 	auto *angles_row = new QHBoxLayout();
 	angles_row->addWidget(new QLabel(obs_module_text("Replay.Export.Angles"), box));
@@ -694,6 +706,14 @@ QWidget *ReplayDock::buildExportBox()
 		angles_row->addWidget(check);
 	}
 	angles_row->addStretch(1);
+
+	auto *encoder_row = new QHBoxLayout();
+	encoder_row->addWidget(new QLabel(obs_module_text("Replay.Export.Encoder"), box));
+	export_encoder_combo = new QComboBox(box);
+	export_encoder_combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+	export_encoder_combo->setMinimumContentsLength(14);
+	connect(export_encoder_combo, &QComboBox::currentIndexChanged, this, &ReplayDock::onSettingsChanged);
+	encoder_row->addWidget(export_encoder_combo, 1);
 
 	layout->addWidget(export_check);
 	layout->addLayout(angles_row);

@@ -27,6 +27,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <thread>
 #include <vector>
 
@@ -75,8 +76,17 @@ struct EventAngle {
 	}
 };
 
+/* One H.264 encoder OBS has registered on this machine. */
+struct EncoderChoice {
+	std::string obs_id;       /* what OBS calls it, stored in the config */
+	std::string display_name; /* what OBS shows in its own settings */
+};
+
+/* The same list OBS offers in Settings → Output, filtered to H.264 and to what we can drive. */
+std::vector<EncoderChoice> available_encoders();
+
 struct ExportOptions {
-	std::string encoder = "auto"; /* auto | x264 | nvenc | amf | qsv */
+	std::string encoder = "auto"; /* "auto" or an OBS encoder id */
 	int crf = 18;
 	/* x264 threads this job may take; 0 = decide alone. Split across angles so the stream keeps cores. */
 	int thread_budget = 0;

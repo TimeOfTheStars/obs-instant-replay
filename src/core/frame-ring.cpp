@@ -92,6 +92,13 @@ void FrameRing::release()
 	plane_count_ = 0;
 	head_.store(0, std::memory_order_release);
 	gap_seq_.store(0, std::memory_order_release);
+	held_back_.store(0, std::memory_order_relaxed);
+	resume_gap_ = false;
+	{
+		std::lock_guard<std::mutex> lock(floor_mutex_);
+		floors_ = {};
+		min_floor_.store(UINT64_MAX, std::memory_order_release);
+	}
 	config_ = RingConfig{};
 }
 
@@ -160,6 +167,56 @@ uint8_t *FrameRing::slot(uint64_t index) const
 	return chunks_[chunk] + offset;
 }
 
+int FrameRing::acquire_floor(uint64_t seq)
+{
+	std::lock_guard<std::mutex> lock(floor_mutex_);
+	for (size_t index = 0; index < kMaxReaders; ++index) {
+		if (floors_[index] != 0)
+			continue;
+
+		floors_[index] = seq + 1; /* stored offset by one so that 0 means "free" */
+		uint64_t lowest = UINT64_MAX;
+		for (uint64_t floor : floors_) {
+			if (floor != 0)
+				lowest = std::min(lowest, floor - 1);
+		}
+		min_floor_.store(lowest, std::memory_order_release);
+		return static_cast<int>(index);
+	}
+
+	return -1; /* no slot free: this reader simply goes unprotected */
+}
+
+void FrameRing::update_floor(int token, uint64_t seq)
+{
+	if (token < 0)
+		return;
+
+	std::lock_guard<std::mutex> lock(floor_mutex_);
+	floors_[static_cast<size_t>(token)] = seq + 1;
+	uint64_t lowest = UINT64_MAX;
+	for (uint64_t floor : floors_) {
+		if (floor != 0)
+			lowest = std::min(lowest, floor - 1);
+	}
+	min_floor_.store(lowest, std::memory_order_release);
+}
+
+void FrameRing::release_floor(int token)
+{
+	if (token < 0)
+		return;
+
+	std::lock_guard<std::mutex> lock(floor_mutex_);
+	floors_[static_cast<size_t>(token)] = 0;
+	uint64_t lowest = UINT64_MAX;
+	for (uint64_t floor : floors_) {
+		if (floor != 0)
+			lowest = std::min(lowest, floor - 1);
+	}
+	min_floor_.store(lowest, std::memory_order_release);
+}
+
 void FrameRing::write(const uint8_t *const source[MAX_AV_PLANES], const uint32_t source_linesize[MAX_AV_PLANES],
 		      uint64_t timestamp, bool starts_gap)
 {
@@ -168,6 +225,25 @@ void FrameRing::write(const uint8_t *const source[MAX_AV_PLANES], const uint32_t
 
 	/* Single producer: a relaxed load of our own head is enough. */
 	const uint64_t seq = head_.load(std::memory_order_relaxed);
+
+	/*
+	 * Do not destroy a frame an export is still reading. Dropping the incoming frame stalls the
+	 * live buffer for as long as the export lags, which is far cheaper than an incomplete clip.
+	 */
+	if (seq >= capacity_) {
+		const uint64_t victim = seq - capacity_;
+		if (victim >= min_floor_.load(std::memory_order_acquire)) {
+			held_back_.fetch_add(1, std::memory_order_relaxed);
+			resume_gap_ = true;
+			return;
+		}
+	}
+
+	if (resume_gap_) {
+		/* Frames were dropped: the recording is no longer continuous across this point. */
+		resume_gap_ = false;
+		starts_gap = true;
+	}
 	const size_t index = static_cast<size_t>(seq % capacity_);
 	uint8_t *destination = slot(index);
 

@@ -104,40 +104,80 @@ bool hardware_encoder_available(const char *ffmpeg_name)
 }
 
 /* FFmpeg encoder for a panel choice (auto | x264 | nvenc | amf | qsv). */
+/*
+ * OBS encoder id -> the FFmpeg encoder that drives the same hardware. The panel shows the names OBS
+ * itself shows, so the operator picks from the list they already know instead of from vendor
+ * abbreviations that may not exist on this machine.
+ */
+const char *ffmpeg_name_for_obs_encoder(const char *obs_id)
+{
+	if (!obs_id)
+		return nullptr;
+	if (strstr(obs_id, "nvenc"))
+		return "h264_nvenc";
+	if (strstr(obs_id, "amf"))
+		return "h264_amf";
+	if (strstr(obs_id, "qsv"))
+		return "h264_qsv";
+	if (strstr(obs_id, "x264"))
+		return "libx264";
+	if (strstr(obs_id, "videotoolbox"))
+		return "h264_videotoolbox";
+	return nullptr;
+}
+
 std::string resolve_encoder(const std::string &requested)
 {
+	if (requested.empty() || requested == "auto") {
+		/*
+		 * Do not fight the broadcast for the same silicon: if the stream runs on a GPU encoder the
+		 * CPU is the free resource, and the other way round.
+		 */
+		bool stream_uses_gpu = false;
+		std::string stream_id;
+		if (config_t *profile = obs_frontend_get_profile_config()) {
+			const char *mode = config_get_string(profile, "Output", "Mode");
+			const bool advanced = mode && strcmp(mode, "Advanced") == 0;
+			const char *encoder = advanced ? config_get_string(profile, "AdvOut", "Encoder")
+						       : config_get_string(profile, "SimpleOutput", "StreamEncoder");
+			if (encoder) {
+				stream_id = encoder;
+				stream_uses_gpu = strstr(encoder, "nvenc") || strstr(encoder, "amf") ||
+						  strstr(encoder, "qsv") || strstr(encoder, "amd") ||
+						  strstr(encoder, "videotoolbox");
+			}
+		}
+
+		if (stream_uses_gpu)
+			return "libx264";
+
+		/* Whatever hardware OBS actually found — that check is what tells us the driver is there. */
+		for (const EncoderChoice &choice : available_encoders()) {
+			const char *name = ffmpeg_name_for_obs_encoder(choice.obs_id.c_str());
+			if (!name || strcmp(name, "libx264") == 0)
+				continue;
+			if (avcodec_find_encoder_by_name(name))
+				return name;
+		}
+		return "libx264";
+	}
+
+	/* An explicit choice from the panel: it is an OBS encoder id. */
+	if (const char *name = ffmpeg_name_for_obs_encoder(requested.c_str())) {
+		if (avcodec_find_encoder_by_name(name))
+			return name;
+	}
+
+	/* Older configs stored the vendor shorthand. */
 	if (requested == "x264")
 		return "libx264";
-	if (requested == "nvenc")
-		return hardware_encoder_available("h264_nvenc") ? "h264_nvenc" : "libx264";
-	if (requested == "amf")
-		return hardware_encoder_available("h264_amf") ? "h264_amf" : "libx264";
-	if (requested == "qsv")
-		return hardware_encoder_available("h264_qsv") ? "h264_qsv" : "libx264";
+	if (requested == "nvenc" && avcodec_find_encoder_by_name("h264_nvenc"))
+		return "h264_nvenc";
+	if (requested == "amf" && avcodec_find_encoder_by_name("h264_amf"))
+		return "h264_amf";
+	if (requested == "qsv" && avcodec_find_encoder_by_name("h264_qsv"))
+		return "h264_qsv";
 
-	/*
-	 * Auto: stay off whatever the stream is using. A GPU stream leaves the CPU free for x264;
-	 * an x264 stream leaves the GPU free, so take the vendor's encoder OBS has actually probed
-	 * (NVIDIA or AMD or Intel — whichever this machine has).
-	 */
-	bool stream_on_gpu = false;
-	if (config_t *profile = obs_frontend_get_profile_config()) {
-		const char *mode = config_get_string(profile, "Output", "Mode");
-		const bool advanced = mode && strcmp(mode, "Advanced") == 0;
-		const char *encoder = advanced ? config_get_string(profile, "AdvOut", "Encoder")
-					       : config_get_string(profile, "SimpleOutput", "StreamEncoder");
-		/* Simple mode: "nvenc", "amd", "qsv"; advanced mode: "obs_nvenc_*", "h264_texture_amf", "obs_qsv11*". */
-		stream_on_gpu = encoder && (strstr(encoder, "nvenc") || strstr(encoder, "amd") ||
-					    strstr(encoder, "amf") || strstr(encoder, "qsv"));
-	}
-
-	if (stream_on_gpu)
-		return "libx264";
-
-	for (const char *gpu : {"h264_nvenc", "h264_amf", "h264_qsv"}) {
-		if (hardware_encoder_available(gpu))
-			return gpu;
-	}
 	return "libx264";
 }
 
@@ -207,6 +247,41 @@ struct EncodeSession {
 };
 
 } // namespace
+
+std::vector<EncoderChoice> available_encoders()
+{
+	std::vector<EncoderChoice> found;
+	const char *id = nullptr;
+
+	for (size_t index = 0; obs_enum_encoder_types(index, &id); ++index) {
+		if (obs_get_encoder_type(id) != OBS_ENCODER_VIDEO)
+			continue;
+
+		const char *codec = obs_get_encoder_codec(id);
+		if (!codec || strcmp(codec, "h264") != 0)
+			continue;
+
+		/* Only encoders we can actually drive through FFmpeg. */
+		const char *name = ffmpeg_name_for_obs_encoder(id);
+		if (!name || !avcodec_find_encoder_by_name(name))
+			continue;
+
+		EncoderChoice choice;
+		choice.obs_id = id;
+		const char *display = obs_encoder_get_display_name(id);
+		choice.display_name = display ? display : id;
+
+		/* Several OBS ids map onto one FFmpeg encoder (texture and CUDA NVENC); show one entry. */
+		const bool duplicate = std::any_of(found.begin(), found.end(), [&](const EncoderChoice &existing) {
+			const char *existing_name = ffmpeg_name_for_obs_encoder(existing.obs_id.c_str());
+			return existing_name && strcmp(existing_name, name) == 0;
+		});
+		if (!duplicate)
+			found.push_back(std::move(choice));
+	}
+
+	return found;
+}
 
 ClipExporter &ClipExporter::instance()
 {
@@ -383,7 +458,7 @@ void ClipExporter::worker_loop()
 void ClipExporter::run(const Job &job)
 {
 	AngleManager &angles = AngleManager::instance();
-	const AngleCapture &capture = angles.angle(job.angle);
+	AngleCapture &capture = angles.angle(job.angle);
 	const std::string &path = job.path;
 
 	if (!capture.running()) {
@@ -391,7 +466,7 @@ void ClipExporter::run(const Job &job)
 		return;
 	}
 
-	const FrameRing &ring = capture.ring();
+	FrameRing &ring = capture.ring();
 	const RingConfig config = ring.config();
 
 	/* Frames are addressed by time, so the expected count follows from the clip, not from seq. */
@@ -594,6 +669,17 @@ void ClipExporter::run(const Job &job)
 		}
 	}
 
+	/*
+	 * Claim everything from here on so the capture thread cannot overwrite the clip while it is
+	 * being encoded. Without this the angle that starts encoding last — camera 2, then camera 3 —
+	 * loses the head of its clip and the file comes out incomplete.
+	 */
+	struct FloorGuard {
+		FrameRing &ring;
+		int token;
+		~FloorGuard() { ring.release_floor(token); }
+	} floor{ring, ring.acquire_floor(seq)};
+
 	/* Guards against spinning if the writer keeps outrunning us while nothing has been written yet. */
 	int skips = 0;
 	constexpr int kMaxSkips = 400;
@@ -699,6 +785,8 @@ void ClipExporter::run(const Job &job)
 
 		++written_frames;
 		++seq;
+		/* Everything before this is free again: release it so the live buffer keeps moving. */
+		ring.update_floor(floor.token, seq);
 		if ((written_frames & 15) == 0)
 			update(job.id, ExportState::Encoding, written_frames, total, path, "");
 	}
@@ -747,6 +835,11 @@ void ClipExporter::run(const Job &job)
 		update(job.id, ExportState::DoneTruncated, written_frames, total, path, "");
 		return;
 	}
+
+	const uint64_t held_back = ring.frames_held_back();
+	if (held_back > 0)
+		obs_log(LOG_WARNING, "export #%d: the live buffer dropped %llu frames waiting for this export", job.id,
+			static_cast<unsigned long long>(held_back));
 
 	obs_log(LOG_INFO, "export #%d: done, %llu frames in %.1f s = %.0f fps", job.id,
 		static_cast<unsigned long long>(written_frames), seconds, encoded_fps);

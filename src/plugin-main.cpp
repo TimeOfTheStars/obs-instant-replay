@@ -49,8 +49,11 @@ static void on_frontend_event(enum obs_frontend_event event, void *)
 	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
 		/* Video output exists only once the frontend has finished starting up. */
 		AngleManager::instance().start_from_settings();
-		if (dock_widget)
+		if (dock_widget) {
 			dock_widget->refreshSceneList();
+			/* Encoders from other plugins finish registering only now. */
+			dock_widget->refreshEncoderList();
+		}
 		break;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGING:
 		/*
