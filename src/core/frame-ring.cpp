@@ -80,6 +80,7 @@ FrameRing::~FrameRing()
 
 void FrameRing::release()
 {
+	++generation_;
 	for (uint8_t *chunk : chunks_)
 		bfree(chunk);
 
@@ -170,6 +171,8 @@ uint8_t *FrameRing::slot(uint64_t index) const
 int FrameRing::acquire_floor(uint64_t seq)
 {
 	std::lock_guard<std::mutex> lock(floor_mutex_);
+	if (capacity_ == 0 || seq < oldest() || seq >= head())
+		return -1;
 	for (size_t index = 0; index < kMaxReaders; ++index) {
 		if (floors_[index] != 0)
 			continue;
@@ -184,7 +187,7 @@ int FrameRing::acquire_floor(uint64_t seq)
 		return static_cast<int>(index);
 	}
 
-	return -1; /* no slot free: this reader simply goes unprotected */
+	return -1; /* Caller must reject the export rather than read unprotected frames. */
 }
 
 void FrameRing::update_floor(int token, uint64_t seq)
@@ -223,6 +226,15 @@ void FrameRing::write(const uint8_t *const source[MAX_AV_PLANES], const uint32_t
 	if (capacity_ == 0)
 		return;
 
+	/* Never wait on an exporter in the capture callback. This also makes claiming a
+	 * floor atomic with respect to starting a slot overwrite. */
+	std::unique_lock<std::mutex> floor_lock(floor_mutex_, std::try_to_lock);
+	if (!floor_lock.owns_lock()) {
+		held_back_.fetch_add(1, std::memory_order_relaxed);
+		resume_gap_ = true;
+		return;
+	}
+
 	/* Single producer: a relaxed load of our own head is enough. */
 	const uint64_t seq = head_.load(std::memory_order_relaxed);
 
@@ -230,9 +242,10 @@ void FrameRing::write(const uint8_t *const source[MAX_AV_PLANES], const uint32_t
 	 * Do not destroy a frame an export is still reading. Dropping the incoming frame stalls the
 	 * live buffer for as long as the export lags, which is far cheaper than an incomplete clip.
 	 */
-	if (seq >= capacity_) {
-		const uint64_t victim = seq - capacity_;
-		if (victim >= min_floor_.load(std::memory_order_acquire)) {
+	if (seq + 1 >= capacity_) {
+		/* Account for the head we would publish, including the first wrap. */
+		const uint64_t next_oldest = seq + 2 - capacity_;
+		if (next_oldest > min_floor_.load(std::memory_order_acquire)) {
 			held_back_.fetch_add(1, std::memory_order_relaxed);
 			resume_gap_ = true;
 			return;

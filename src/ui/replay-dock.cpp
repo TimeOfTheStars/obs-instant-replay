@@ -766,7 +766,7 @@ void ReplayDock::onMark()
 	if (settings.export_enabled) {
 		AngleManager &angles = AngleManager::instance();
 
-		/* Decide the whole set first: the thread budget depends on how many angles are queued. */
+		/* Resolve the available angles before creating the shared event file stem. */
 		std::vector<int> queued;
 		for (int angle = 0; angle < kAngleCount; ++angle) {
 			if (!settings.export_angles[static_cast<size_t>(angle)])
@@ -786,23 +786,14 @@ void ReplayDock::onMark()
 			obs_log(LOG_WARNING, "export: %s", path_error.c_str());
 			format_label->setText(QString::fromStdString(path_error));
 		} else {
-			/*
-			 * Split x264 threads across the jobs, otherwise three exports would each grab half the
-			 * machine and starve the encoder that is feeding the broadcast.
-			 */
-			const int budget = std::max(2, os_get_logical_cores() / 2);
-			const int program_threads = std::max(2, budget / 2);
-			const int camera_jobs =
-				static_cast<int>(queued.size()) -
-				(std::find(queued.begin(), queued.end(), kProgramAngle) != queued.end() ? 1 : 0);
-			const int camera_threads =
-				camera_jobs > 0 ? std::max(1, (budget - program_threads) / camera_jobs) : 0;
+			/* Exports run sequentially; leave most CPU threads to the broadcast. */
+			const int export_threads = std::clamp(os_get_logical_cores() / 4, 1, 2);
 
 			for (int angle : queued) {
 				ExportOptions options;
 				options.encoder = settings.export_encoder;
 				options.crf = settings.export_crf;
-				options.thread_budget = angle == kProgramAngle ? program_threads : camera_threads;
+				options.thread_budget = export_threads;
 
 				EventAngle &slot = event.angles[static_cast<size_t>(angle)];
 				slot.requested = true;

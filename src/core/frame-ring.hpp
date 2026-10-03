@@ -58,7 +58,7 @@ struct RingConfig {
  * store of the head sequence, so a consumer that observes head == N is guaranteed to see the
  * full contents of slot N-1.
  *
- * All memory is allocated up front: the write path must not allocate, lock or log.
+ * All memory is allocated up front: the write path must not allocate, wait for a lock or log.
  */
 class FrameRing {
 public:
@@ -106,6 +106,9 @@ public:
 	 */
 	bool find_by_timestamp(uint64_t timestamp, uint64_t lo, uint64_t hi, uint64_t &seq) const;
 
+	/* Accessed under AngleManager's teardown guard. Changes whenever storage is released. */
+	uint64_t generation() const { return generation_; }
+
 	uint64_t capacity() const { return capacity_; }
 	uint64_t bytes_allocated() const { return bytes_allocated_; }
 	const RingConfig &config() const { return config_; }
@@ -126,6 +129,7 @@ private:
 	size_t plane_offset_[MAX_AV_PLANES] = {};
 	size_t plane_count_ = 0;
 
+	uint64_t generation_ = 0;
 	uint64_t capacity_ = 0;
 	uint64_t bytes_allocated_ = 0;
 

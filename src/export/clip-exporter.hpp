@@ -27,7 +27,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <map>
 #include <mutex>
 #include <string>
-#include <vector>
 #include <thread>
 #include <vector>
 
@@ -88,16 +87,15 @@ std::vector<EncoderChoice> available_encoders();
 struct ExportOptions {
 	std::string encoder = "auto"; /* "auto" or an OBS encoder id */
 	int crf = 18;
-	/* x264 threads this job may take; 0 = decide alone. Split across angles so the stream keeps cores. */
+	/* x264 threads this job may take; capped at two to leave CPU time for the broadcast. */
 	int thread_budget = 0;
 };
 
 /*
  * Encodes marked clips straight out of the ring into MP4 files on a low-priority worker thread.
  *
- * The ring keeps moving underneath: a clip nearly as long as the buffer has its first frames
- * overwritten within tens of milliseconds, so every frame is re-validated after it is copied and
- * a clip that loses frames is written truncated rather than corrupted.
+ * Every queued clip holds a reader floor from MARK until completion. Capture drops incoming
+ * frames rather than overwriting that clip. Jobs run sequentially to bound encoder load.
  */
 class ClipExporter {
 public:
@@ -117,7 +115,7 @@ public:
 	/* Finishes the current file early, drops the queue and joins the workers. Qt thread. */
 	void shutdown();
 
-	/* True once exporting was caught costing the broadcast frames; concurrency drops to one. */
+	/* True once OBS reported lost frames during export; subsequent frames are paced. */
 	bool safe_mode() const { return safe_mode_.load(std::memory_order_acquire); }
 
 private:
@@ -126,7 +124,7 @@ private:
 
 	struct Job {
 		int id = 0;
-		/* Index, never a pointer: AngleManager rebuilds AngleCapture objects on settings changes. */
+		/* Ring storage may be rebuilt on settings changes; generation identifies this capture run. */
 		int angle = 0;
 		Clip clip;
 		std::string path;
@@ -134,6 +132,7 @@ private:
 		int crf = 18;
 		int thread_budget = 0;
 		/* Claimed at MARK, released when the job ends: keeps the writer off the clip. */
+		uint64_t generation = 0;
 		uint64_t seq_begin = 0;
 		int floor_token = -1;
 	};
@@ -143,6 +142,7 @@ private:
 	bool take_job(Job &job);
 	void note_job_started();
 	void note_job_finished();
+	void monitor_load();
 	void run(const Job &job);
 	void update(int job_id, ExportState state, uint64_t done, uint64_t total, const std::string &path,
 		    const std::string &error);
@@ -153,10 +153,8 @@ private:
 	std::deque<Job> queue_;
 	std::map<int, ExportStatus> statuses_;
 	std::vector<std::thread> workers_;
-	int running_jobs_ = 0;
 	uint32_t skipped_at_start_ = 0;
 	uint32_t lagged_at_start_ = 0;
-	std::atomic<int> hardware_jobs_{0};
 	std::atomic<bool> safe_mode_{false};
 	std::atomic<bool> stop_{false};
 	int next_id_ = 1;

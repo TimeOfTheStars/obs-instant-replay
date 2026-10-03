@@ -46,7 +46,7 @@ struct CaptureStatus {
 
 /*
  * One angle: a ring fed by a tap. The frame callback runs on a libobs video-io thread and must
- * never allocate, lock or log — a slow callback shows up as encoder lag on air.
+ * never allocate, wait for a lock or log — a slow callback shows up as encoder lag on air.
  */
 class AngleCapture : public FrameSink {
 public:

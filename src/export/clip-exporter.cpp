@@ -39,6 +39,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 #include <mutex>
 
 #ifdef _WIN32
@@ -148,7 +149,7 @@ std::string resolve_encoder(const std::string &requested)
 			}
 		}
 
-		if (stream_uses_gpu)
+		if (stream_uses_gpu && obs_frontend_streaming_active())
 			return "libx264";
 
 		/* Whatever hardware OBS actually found — that check is what tells us the driver is there. */
@@ -321,6 +322,7 @@ int ClipExporter::enqueue(int angle, const Clip &clip, const std::string &path, 
 		if (capture.running()) {
 			const auto guard = angles.reader_guard();
 			FrameRing &ring = capture.ring();
+			job.generation = ring.generation();
 			const uint64_t head = ring.head();
 			if (head > 0 && ring.find_by_timestamp(clip.ts_in, ring.oldest(), head - 1, job.seq_begin))
 				job.floor_token = ring.acquire_floor(job.seq_begin);
@@ -334,6 +336,12 @@ int ClipExporter::enqueue(int angle, const Clip &clip, const std::string &path, 
 		status.path = path;
 		status.media.angle = angle;
 		statuses_[job.id] = status;
+		if (job.floor_token < 0) {
+			statuses_[job.id].state = ExportState::Failed;
+			statuses_[job.id].error = "cannot protect clip: buffer expired or too many pending exports";
+			obs_log(LOG_WARNING, "export #%d: %s", job.id, statuses_[job.id].error.c_str());
+			return job.id;
+		}
 		queue_.push_back(job);
 	}
 
@@ -355,13 +363,9 @@ void ClipExporter::ensure_workers()
 	if (stop_.load(std::memory_order_acquire))
 		return;
 
-	/*
-	 * One worker per angle: a single queue would encode the angles one after another, and on a
-	 * short ring every angle but the first would find its head already overwritten. Workers read
-	 * different rings, so they do not race each other.
-	 */
-	const size_t wanted = safe_mode() ? 1u : static_cast<size_t>(kAngleCount);
-	while (workers_.size() < wanted && workers_.size() < queue_.size() + workers_.size())
+	/* Floors are claimed at MARK for every angle, including queued jobs. One worker
+	 * keeps both hardware and software encoders from competing with each other. */
+	if (workers_.empty())
 		workers_.emplace_back([this] { worker_loop(); });
 }
 
@@ -373,7 +377,7 @@ void ClipExporter::shutdown()
 		/* Queued jobs never reach a worker, so their claim on the ring has to be dropped here. */
 		AngleManager &angles = AngleManager::instance();
 		for (const Job &job : queue_) {
-			if (job.floor_token >= 0 && angles.angle(job.angle).running())
+			if (job.floor_token >= 0 && angles.angle(job.angle).ring().generation() == job.generation)
 				angles.angle(job.angle).ring().release_floor(job.floor_token);
 		}
 		queue_.clear();
@@ -393,53 +397,37 @@ bool ClipExporter::take_job(Job &job)
 	if (stop_.load(std::memory_order_acquire))
 		return false;
 
-	/* The programme is what goes on air first, so it never waits behind a camera. */
-	auto chosen = queue_.begin();
-	for (auto candidate = queue_.begin(); candidate != queue_.end(); ++candidate) {
-		if (candidate->angle == kProgramAngle) {
-			chosen = candidate;
-			break;
-		}
-	}
-
-	job = *chosen;
-	queue_.erase(chosen);
+	/* FIFO keeps repeated MARKs from starving older camera exports. */
+	job = queue_.front();
+	queue_.pop_front();
 	return true;
 }
 
 void ClipExporter::note_job_started()
 {
-	std::lock_guard<std::mutex> lock(mutex_);
-	if (running_jobs_++ == 0) {
-		/* Snapshot once per burst of exports, so the cost is attributed to the MARK as a whole. */
-		skipped_at_start_ = video_output_get_skipped_frames(obs_get_video());
-		lagged_at_start_ = obs_get_lagged_frames();
-	}
+	/* Only the single export worker reads/writes these counters. */
+	video_t *video = obs_get_video();
+	skipped_at_start_ = video ? video_output_get_skipped_frames(video) : 0;
+	lagged_at_start_ = obs_get_lagged_frames();
+}
+
+void ClipExporter::monitor_load()
+{
+	video_t *video = obs_get_video();
+	if (!video)
+		return;
+	const uint32_t skipped_now = video_output_get_skipped_frames(video);
+	const uint32_t lagged_now = obs_get_lagged_frames();
+	const uint32_t skipped = skipped_now > skipped_at_start_ ? skipped_now - skipped_at_start_ : 0;
+	const uint32_t lagged = lagged_now > lagged_at_start_ ? lagged_now - lagged_at_start_ : 0;
+	if (skipped + lagged > 2 && !safe_mode_.exchange(true, std::memory_order_acq_rel))
+		obs_log(LOG_WARNING, "export: OBS lost %u encoded and %u rendered frames; pacing exports", skipped,
+			lagged);
 }
 
 void ClipExporter::note_job_finished()
 {
-	uint32_t skipped = 0;
-	uint32_t lagged = 0;
-	{
-		std::lock_guard<std::mutex> lock(mutex_);
-		if (--running_jobs_ > 0)
-			return;
-
-		const uint32_t skipped_now = video_output_get_skipped_frames(obs_get_video());
-		const uint32_t lagged_now = obs_get_lagged_frames();
-		skipped = skipped_now > skipped_at_start_ ? skipped_now - skipped_at_start_ : 0;
-		lagged = lagged_now > lagged_at_start_ ? lagged_now - lagged_at_start_ : 0;
-	}
-
-	if (skipped == 0 && lagged == 0)
-		return;
-
-	obs_log(LOG_WARNING, "export cost the broadcast %u encoded and %u rendered frames", skipped, lagged);
-
-	/* Losing frames on air is not worth a faster export: stay conservative for the rest of the session. */
-	if (skipped + lagged > 2 && !safe_mode_.exchange(true, std::memory_order_acq_rel))
-		obs_log(LOG_WARNING, "export switched to safe mode: one angle at a time, faster preset");
+	monitor_load();
 }
 
 void ClipExporter::update(int job_id, ExportState state, uint64_t done, uint64_t total, const std::string &path,
@@ -484,13 +472,33 @@ void ClipExporter::run(const Job &job)
 	AngleCapture &capture = angles.angle(job.angle);
 	const std::string &path = job.path;
 
-	if (!capture.running()) {
-		update(job.id, ExportState::Failed, 0, 0, path, "buffer is not running");
-		return;
-	}
-
 	FrameRing &ring = capture.ring();
-	const RingConfig config = ring.config();
+	/* Release on every exit, including encoder/file-open failures. An old job must
+	 * never release a token belonging to a rebuilt ring. */
+	struct FloorGuard {
+		AngleManager &angles;
+		FrameRing &ring;
+		uint64_t generation;
+		int token;
+		~FloorGuard()
+		{
+			const auto guard = angles.reader_guard();
+			if (ring.generation() == generation)
+				ring.release_floor(token);
+		}
+	} floor{angles, ring, job.generation, job.floor_token};
+
+	RingConfig config;
+	uint64_t held_back_before = 0;
+	{
+		const auto guard = angles.reader_guard();
+		if (!capture.running() || ring.generation() != job.generation) {
+			update(job.id, ExportState::Failed, 0, 0, path, "buffer was restarted before export");
+			return;
+		}
+		config = ring.config();
+		held_back_before = ring.frames_held_back();
+	}
 
 	/* Frames are addressed by time, so the expected count follows from the clip, not from seq. */
 	const uint64_t total = static_cast<uint64_t>(job.clip.duration_sec() * config.fps);
@@ -510,7 +518,6 @@ void ClipExporter::run(const Job &job)
 
 	std::string error;
 	const uint64_t started = os_gettime_ns();
-	const uint64_t held_back_before = ring.frames_held_back();
 	obs_log(LOG_INFO, "export #%d: angle %d -> %s, ~%llu frames, encoder %s", job.id, job.angle, path.c_str(),
 		static_cast<unsigned long long>(total), job.encoder.c_str());
 
@@ -530,7 +537,6 @@ void ClipExporter::run(const Job &job)
 				    "h264_amf",          "h264_qsv", "libopenh264"};
 	std::string open_errors;
 	const AVCodec *codec = nullptr;
-	bool holds_hardware_slot = false;
 
 	for (const char *name : candidates) {
 		const AVCodec *candidate = avcodec_find_encoder_by_name(name);
@@ -538,20 +544,6 @@ void ClipExporter::run(const Job &job)
 			continue;
 		if (!hardware_encoder_available(name))
 			continue; /* no point probing a vendor's encoder on a machine without that GPU */
-
-		const bool hardware = strcmp(candidate->name, "libx264") != 0 &&
-				      strcmp(candidate->name, "libopenh264") != 0;
-		if (hardware && !holds_hardware_slot) {
-			/*
-			 * Consumer GPUs cap concurrent encoder sessions and the broadcast already holds one,
-			 * so only one export at a time may use the hardware; the rest fall back to x264.
-			 */
-			if (hardware_jobs_.fetch_add(1, std::memory_order_acq_rel) != 0) {
-				hardware_jobs_.fetch_sub(1, std::memory_order_acq_rel);
-				continue;
-			}
-			holds_hardware_slot = true;
-		}
 
 		bool already_tried = false;
 		for (const char *earlier : candidates) {
@@ -578,11 +570,9 @@ void ClipExporter::run(const Job &job)
 			session.codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
 		if (strcmp(candidate->name, "libx264") == 0) {
-			/* Leave most cores to the stream encoder; veryfast still beats 50 fps on a modest CPU. */
-			session.codec->thread_count = job.thread_budget > 0
-							      ? job.thread_budget
-							      : std::clamp(os_get_logical_cores() / 2, 2, 6);
-			av_opt_set(session.codec->priv_data, "preset", safe_mode() ? "superfast" : "veryfast", 0);
+			/* Bound CPU use even on old four-core laptops. */
+			session.codec->thread_count = std::clamp(job.thread_budget, 1, 2);
+			av_opt_set(session.codec->priv_data, "preset", safe_mode() ? "ultrafast" : "superfast", 0);
 			av_opt_set_int(session.codec->priv_data, "crf", job.crf, 0);
 		} else if (strcmp(candidate->name, "h264_nvenc") == 0) {
 			av_opt_set(session.codec->priv_data, "preset", "p5", 0);
@@ -682,23 +672,7 @@ void ClipExporter::run(const Job &job)
 	int64_t last_pts = -1;
 	bool truncated = false;
 
-	/* The range was claimed at MARK; release it whichever way this job ends. */
-	struct FloorGuard {
-		FrameRing &ring;
-		int token;
-		~FloorGuard() { ring.release_floor(token); }
-	} floor{ring, job.floor_token};
-
 	uint64_t seq = job.seq_begin;
-	if (job.floor_token < 0) {
-		/* Nothing was claimed (the buffer was not running yet) — find the start and hope. */
-		const auto guard = angles.reader_guard();
-		const uint64_t head = ring.head();
-		if (head == 0 || !ring.find_by_timestamp(job.clip.ts_in, ring.oldest(), head - 1, seq)) {
-			update(job.id, ExportState::Failed, 0, total, path, "clip is no longer in the buffer");
-			return;
-		}
-	}
 
 	/* Guards against spinning if the writer keeps outrunning us while nothing has been written yet. */
 	int skips = 0;
@@ -719,7 +693,7 @@ void ClipExporter::run(const Job &job)
 		{
 			/* Per frame, not per clip: a profile switch must not wait seconds for us. */
 			const auto guard = angles.reader_guard();
-			if (!capture.running()) {
+			if (!capture.running() || ring.generation() != job.generation) {
 				truncated = true;
 				break;
 			}
@@ -806,21 +780,41 @@ void ClipExporter::run(const Job &job)
 		++written_frames;
 		++seq;
 		/* Everything before this is free again: release it so the live buffer keeps moving. */
-		ring.update_floor(floor.token, seq);
+		{
+			const auto guard = angles.reader_guard();
+			if (ring.generation() == job.generation)
+				ring.update_floor(floor.token, seq);
+		}
+		if ((written_frames & 15) == 0)
+			monitor_load();
+		if (safe_mode()) {
+			std::unique_lock<std::mutex> lock(mutex_);
+			wake_.wait_for(lock, std::chrono::duration<double>(1.0 / std::max(config.fps, 1.0)),
+				       [this] { return stop_.load(std::memory_order_acquire); });
+		}
 		if ((written_frames & 15) == 0)
 			update(job.id, ExportState::Encoding, written_frames, total, path, "");
 	}
 
 	if (error.empty() && written_frames > 0) {
-		avcodec_send_frame(session.codec, nullptr);
-		drain(true);
+		result = avcodec_send_frame(session.codec, nullptr);
+		if (result < 0)
+			error = "encoder flush failed: " + ffmpeg_error(result);
+		else
+			drain(true);
 	}
 
-	if (holds_hardware_slot)
-		hardware_jobs_.fetch_sub(1, std::memory_order_acq_rel);
+	/* Publish Done only after MP4 metadata is written and the file is closed. */
+	result = av_write_trailer(session.format);
+	session.header_written = false;
+	if (result < 0 && error.empty())
+		error = "cannot finalize MP4: " + ffmpeg_error(result);
+	result = avio_closep(&session.format->pb);
+	if (result < 0 && error.empty())
+		error = "cannot close MP4: " + ffmpeg_error(result);
 
 	const double seconds = static_cast<double>(os_gettime_ns() - started) / 1e9;
-	/* Encoding speed decides whether several angles can be exported at once; log it to tune that. */
+	/* Report throughput to diagnose how long the queue holds capture frames. */
 	const double encoded_fps = seconds > 0.0 ? static_cast<double>(written_frames) / seconds : 0.0;
 
 	if (!error.empty()) {
@@ -856,7 +850,12 @@ void ClipExporter::run(const Job &job)
 		return;
 	}
 
-	const uint64_t held_back = ring.frames_held_back() - held_back_before;
+	uint64_t held_back = 0;
+	{
+		const auto guard = angles.reader_guard();
+		if (ring.generation() == job.generation)
+			held_back = ring.frames_held_back() - held_back_before;
+	}
 	if (held_back > 0)
 		obs_log(LOG_WARNING, "export #%d: the live buffer dropped %llu frames waiting for this export", job.id,
 			static_cast<unsigned long long>(held_back));
