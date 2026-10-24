@@ -33,6 +33,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 class QButtonGroup;
 class QCheckBox;
 class QComboBox;
+class QDialog;
 class QLineEdit;
 class QDoubleSpinBox;
 class QLabel;
@@ -71,6 +72,7 @@ public slots:
 	void refreshEncoderList();
 
 private slots:
+	void openSettings();
 	void onSpeedChanged(int speed_percent);
 	void onEventActivated();
 	void onEventSelected();
@@ -87,14 +89,16 @@ private slots:
 
 private:
 	QWidget *buildStatusRow();
-	QWidget *buildCaptureRow();
+	QWidget *buildTransportRow();
+	QWidget *buildFooterRow();
+	QWidget *buildCaptureBox();
 	QWidget *buildSpeedRow();
 	QWidget *buildAnglesBox();
 	QWidget *buildAngleRow();
 	QWidget *buildTimelineRow();
 	QWidget *buildEventsBox();
-	QWidget *buildTransportRow();
 	QWidget *buildExportBox();
+	void buildSettingsDialog();
 
 	/* status row */
 	QProgressBar *buffer_bar = nullptr;
@@ -130,6 +134,9 @@ private:
 	QButtonGroup *angle_group = nullptr;
 	/* Starts true: combo boxes fire change signals while they are being built and filled. */
 	bool scene_list_updating = true;
+
+	/* Everything the operator sets once lives here, out of the way of the live controls. */
+	QDialog *settings_dialog = nullptr;
 
 	QTimer *status_timer = nullptr;
 	QTimer *save_timer = nullptr;

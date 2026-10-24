@@ -38,6 +38,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFileDialog>
+#include <QDialog>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QFont>
@@ -114,15 +115,21 @@ ReplayDock::ReplayDock(QWidget *parent) : QWidget(parent)
 	scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 	outer->addWidget(scroll);
 
+	/*
+	 * Live controls only, in the order they are used: the three transport buttons sit at the very
+	 * top so STOP is always one click away without scrolling. Everything that is configured once
+	 * moved into a separate dialog.
+	 */
 	layout->addWidget(buildStatusRow());
-	layout->addWidget(buildCaptureRow());
-	layout->addWidget(buildAnglesBox());
+	layout->addWidget(buildTransportRow());
 	layout->addWidget(buildSpeedRow());
 	layout->addWidget(buildAngleRow());
 	layout->addWidget(buildTimelineRow());
 	layout->addWidget(buildEventsBox(), 1);
-	layout->addWidget(buildExportBox());
-	layout->addWidget(buildTransportRow());
+	layout->addWidget(buildFooterRow());
+
+	/* Built up front, shown on demand: every pointer below stays valid from the start. */
+	buildSettingsDialog();
 
 	setMinimumWidth(320);
 
@@ -272,28 +279,65 @@ QWidget *ReplayDock::buildStatusRow()
 
 	format_label = new QLabel(obs_module_text("Replay.Status.NoBuffer"), box);
 	format_label->setEnabled(false);
+	format_label->setWordWrap(true);
+
+	/* Camera buffers are live state, so they stay visible next to the controls. */
+	cameras_label = new QLabel(box);
+	cameras_label->setWordWrap(true);
+	cameras_label->setEnabled(false);
 
 	outer->addLayout(top);
 	outer->addWidget(format_label);
+	outer->addWidget(cameras_label);
 	return box;
 }
 
-QWidget *ReplayDock::buildCaptureRow()
+QWidget *ReplayDock::buildTransportRow()
+{
+	auto *box = new QWidget(this);
+	auto *row = new QHBoxLayout(box);
+	row->setContentsMargins(0, 0, 0, 0);
+	row->setSpacing(6);
+
+	mark_button = new QPushButton(obs_module_text("Replay.Mark"), box);
+	play_button = new QPushButton(obs_module_text("Replay.Play"), box);
+	stop_button = new QPushButton(obs_module_text("Replay.Stop"), box);
+
+	for (QPushButton *button : {mark_button, play_button, stop_button}) {
+		button->setMinimumHeight(48);
+		QFont font = button->font();
+		font.setBold(true);
+		button->setFont(font);
+	}
+
+	connect(mark_button, &QPushButton::clicked, this, &ReplayDock::onMark);
+	connect(play_button, &QPushButton::clicked, this, &ReplayDock::onPlay);
+	connect(stop_button, &QPushButton::clicked, this, &ReplayDock::onStop);
+
+	row->addWidget(mark_button, 3);
+	row->addWidget(play_button, 4);
+	row->addWidget(stop_button, 2);
+	return box;
+}
+
+QWidget *ReplayDock::buildFooterRow()
 {
 	auto *box = new QWidget(this);
 	auto *row = new QHBoxLayout(box);
 	row->setContentsMargins(0, 0, 0, 0);
 
-	mark_button = new QPushButton(obs_module_text("Replay.Mark"), box);
-	mark_button->setMinimumHeight(56);
-	QFont mark_font = mark_button->font();
-	mark_font.setBold(true);
-	mark_font.setPointSize(mark_font.pointSize() + 2);
-	mark_button->setFont(mark_font);
-	connect(mark_button, &QPushButton::clicked, this, &ReplayDock::onMark);
+	auto *settings_button = new QPushButton(obs_module_text("Replay.Settings"), box);
+	connect(settings_button, &QPushButton::clicked, this, &ReplayDock::openSettings);
 
-	auto *form = new QFormLayout();
-	form->setContentsMargins(0, 0, 0, 0);
+	row->addStretch(1);
+	row->addWidget(settings_button);
+	return box;
+}
+
+QWidget *ReplayDock::buildCaptureBox()
+{
+	auto *box = new QGroupBox(obs_module_text("Replay.Capture"), settings_dialog);
+	auto *form = new QFormLayout(box);
 
 	/* A goal is roughly "4 s before the whistle, 2 s after", hence two numbers, not a range. */
 	length_spin = new QDoubleSpinBox(box);
@@ -316,19 +360,48 @@ QWidget *ReplayDock::buildCaptureRow()
 	buffer_spin->setSuffix(QStringLiteral(" s"));
 	buffer_spin->setKeyboardTracking(false);
 
+	auto_return_check = new QCheckBox(obs_module_text("Replay.AutoReturn"), box);
+	auto_return_check->setChecked(PluginSettings::instance().auto_return);
+
 	form->addRow(obs_module_text("Replay.Length"), length_spin);
 	form->addRow(obs_module_text("Replay.Offset"), offset_spin);
 	form->addRow(obs_module_text("Replay.BufferLength"), buffer_spin);
+	form->addRow(auto_return_check);
 
 	clampClipLength();
 
 	connect(length_spin, &QDoubleSpinBox::valueChanged, this, &ReplayDock::onSettingsChanged);
 	connect(offset_spin, &QDoubleSpinBox::valueChanged, this, &ReplayDock::onSettingsChanged);
 	connect(buffer_spin, &QDoubleSpinBox::valueChanged, this, &ReplayDock::applyBufferSetting);
-
-	row->addWidget(mark_button, 1);
-	row->addLayout(form, 1);
+	connect(auto_return_check, &QCheckBox::toggled, this, &ReplayDock::onSettingsChanged);
 	return box;
+}
+
+void ReplayDock::buildSettingsDialog()
+{
+	settings_dialog = new QDialog(this);
+	settings_dialog->setWindowTitle(obs_module_text("Replay.Settings.Title"));
+	settings_dialog->setModal(false); /* the operator may want to watch the buffer fill while setting up */
+
+	auto *layout = new QVBoxLayout(settings_dialog);
+	layout->setSpacing(8);
+	layout->addWidget(buildCaptureBox());
+	layout->addWidget(buildAnglesBox());
+	layout->addWidget(buildExportBox());
+
+	auto *buttons = new QHBoxLayout();
+	auto *close = new QPushButton(obs_module_text("Replay.Settings.Close"), settings_dialog);
+	connect(close, &QPushButton::clicked, settings_dialog, &QDialog::hide);
+	buttons->addStretch(1);
+	buttons->addWidget(close);
+	layout->addLayout(buttons);
+}
+
+void ReplayDock::openSettings()
+{
+	settings_dialog->show();
+	settings_dialog->raise();
+	settings_dialog->activateWindow();
 }
 
 QWidget *ReplayDock::buildSpeedRow()
@@ -356,7 +429,7 @@ QWidget *ReplayDock::buildSpeedRow()
 
 QWidget *ReplayDock::buildAnglesBox()
 {
-	auto *box = new QGroupBox(obs_module_text("Replay.Angles"), this);
+	auto *box = new QGroupBox(obs_module_text("Replay.Angles"), settings_dialog);
 	auto *layout = new QVBoxLayout(box);
 	layout->setContentsMargins(6, 6, 6, 6);
 	layout->setSpacing(4);
@@ -396,10 +469,6 @@ QWidget *ReplayDock::buildAnglesBox()
 	memory_label->setWordWrap(true);
 	layout->addWidget(memory_label);
 
-	cameras_label = new QLabel(box);
-	cameras_label->setWordWrap(true);
-	cameras_label->setEnabled(false);
-	layout->addWidget(cameras_label);
 	return box;
 }
 
@@ -665,7 +734,7 @@ QWidget *ReplayDock::buildEventsBox()
 
 QWidget *ReplayDock::buildExportBox()
 {
-	auto *box = new QGroupBox(obs_module_text("Replay.Export"), this);
+	auto *box = new QGroupBox(obs_module_text("Replay.Export"), settings_dialog);
 	auto *layout = new QVBoxLayout(box);
 	layout->setContentsMargins(6, 6, 6, 6);
 	layout->setSpacing(4);
@@ -719,33 +788,6 @@ QWidget *ReplayDock::buildExportBox()
 	layout->addLayout(angles_row);
 	layout->addLayout(folder_row);
 	layout->addLayout(encoder_row);
-	return box;
-}
-
-QWidget *ReplayDock::buildTransportRow()
-{
-	auto *box = new QWidget(this);
-	auto *outer = new QVBoxLayout(box);
-	outer->setContentsMargins(0, 0, 0, 0);
-	outer->setSpacing(6);
-
-	auto *row = new QHBoxLayout();
-	play_button = new QPushButton(obs_module_text("Replay.Play"), box);
-	play_button->setMinimumHeight(40);
-	stop_button = new QPushButton(obs_module_text("Replay.Stop"), box);
-	stop_button->setMinimumHeight(40);
-	connect(play_button, &QPushButton::clicked, this, &ReplayDock::onPlay);
-	connect(stop_button, &QPushButton::clicked, this, &ReplayDock::onStop);
-
-	row->addWidget(play_button, 3);
-	row->addWidget(stop_button, 1);
-
-	auto_return_check = new QCheckBox(obs_module_text("Replay.AutoReturn"), box);
-	auto_return_check->setChecked(PluginSettings::instance().auto_return);
-	connect(auto_return_check, &QCheckBox::toggled, this, &ReplayDock::onSettingsChanged);
-
-	outer->addLayout(row);
-	outer->addWidget(auto_return_check);
 	return box;
 }
 
